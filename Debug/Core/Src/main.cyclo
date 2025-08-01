@@ -1,0 +1,9 @@
+../Core/Src/main.c:147:5:main	85
+../Core/Src/main.c:794:6:SystemClock_Config	3
+../Core/Src/main.c:841:13:MX_CAN1_Init	2
+../Core/Src/main.c:878:13:MX_CAN2_Init	2
+../Core/Src/main.c:915:13:MX_SPI1_Init	2
+../Core/Src/main.c:953:13:MX_GPIO_Init	1
+../Core/Src/main.c:993:13:configCan1Filters	1
+../Core/Src/main.c:1011:13:configCan2Filters	3
+../Core/Src/main.c:1047:6:Error_Handler	1

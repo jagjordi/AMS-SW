@@ -61,6 +61,8 @@ void Error_Handler(void);
 #define MCU_STATUS_LED1_GPIO_Port GPIOE
 #define MCU_STATUS_LED2_Pin GPIO_PIN_3
 #define MCU_STATUS_LED2_GPIO_Port GPIOE
+#define SPI1_SSN_Pin GPIO_PIN_4
+#define SPI1_SSN_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
 
