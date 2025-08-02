@@ -266,14 +266,17 @@ int main(void)
 
     // TODO: Consider moving this to an interrupt if IVT messages are more frequent and FIFO overflows
     // In general IVT overflows should not matter much since we will read the latest message
-    // read can 1
     readCanMessages();
 
     stepStateMachine();
 
-    // find max and min voltages and temperatures
     deltaTick = HAL_GetTick() - tick;
     sendStatus();
+
+    while (HAL_GetTick() - tick < CYCLE_TIME);
+
+    HAL_GPIO_TogglePin(WATCHDOG_INPUT_GPIO_Port, WATCHDOG_INPUT_Pin); // Toggle watchdog pin
+    if (!amssTxMessageCounter) HAL_GPIO_TogglePin(MCU_STATUS_LED3_GPIO_Port, MCU_STATUS_LED3_Pin);
 
   }
   /* USER CODE END 3 */
