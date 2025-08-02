@@ -1,0 +1,2 @@
+../Core/Src/thermistor_lut.c:43:12:find_segment	3
+../Core/Src/thermistor_lut.c:59:7:thermistor_adc_to_c_float	3

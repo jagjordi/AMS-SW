@@ -24,11 +24,19 @@
 #include "can1.h"
 #include "can2.h"
 #include "ltc6804.h"
+#include "thermistor_lut.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum
+{
+  STATE_IDLE = 0,
+  STATE_PRECHARGE1,
+  STATE_PRECHARGE2,
+  STATE_TS_ON,
+  STATE_ERROR
+} State_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -36,27 +44,39 @@
 #define OVP VOLTAGE2RAW(4.0) // Over-voltage protection threshold
 #define UVP VOLTAGE2RAW(2.5) // Under-voltage protection threshold
 
+// adc_from_temp_c = lambda t: (lambda x: round(30000.0*x/(1.0+x)))(math.exp(3500.0*((1.0/(t+273.15))-(1.0/298.15))))
+#define OTP 6768 // 60 degrees
+#define UTP 24796 // -10 degrees
+
 #define OVP_COUNT_THRESHOLD 10 // Number of consecutive OVP events to trigger protection
 #define UVP_COUNT_THRESHOLD 10 // Number of consecutive UVP events to trigger protection
 #define OTP_COUNT_THRESHOLD 10 // Number of consecutive OTP events to trigger protection
 #define UTP_COUNT_THRESHOLD 10 // Number of consecutive UTP events to trigger protection
 #define SPI_ERROR_COUNT_THRESHOLD 5 // Number of consecutive SPI errors to trigger protection
+
+#define PRECHARGE_TIMEOUT 10000 // Timeout for precharge in milliseconds
+#define MIN_PRECHARGE_TIME 5000
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define VOLTAGE2RAW(V) ((uint16_t)((V) * 10000)) // Convert voltage in V to raw value (assuming 2.5V reference)
+#define VOLTAGE2RAW(V) ((uint16_t)((V) * 10000)) // Convert voltage in V to raw ADC value
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+ADC_HandleTypeDef hadc2;
+ADC_HandleTypeDef hadc3;
+
 CAN_HandleTypeDef hcan1;
 CAN_HandleTypeDef hcan2;
 
 SPI_HandleTypeDef hspi1;
 
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
+
 /* USER CODE BEGIN PV */
-
-
 
 /* CAN stuff */
 CAN_TxHeaderTypeDef txHeader;
@@ -64,6 +84,7 @@ CAN_RxHeaderTypeDef rxHeader;
 uint8_t txData[8];
 uint8_t rxData[8];
 
+// TX structs
 struct can1_ams_status_1_t can1_ams_status_1;
 struct can1_ams_s01_voltages_1_t can1_ams_s01_voltages_1;
 struct can1_ams_s01_voltages_2_t can1_ams_s01_voltages_2;
@@ -89,7 +110,7 @@ struct can1_ams_s11_voltages_1_t can1_ams_s11_voltages_1;
 struct can1_ams_s11_voltages_2_t can1_ams_s11_voltages_2;
 struct can1_ams_s12_voltages_1_t can1_ams_s12_voltages_1;
 struct can1_ams_s12_voltages_2_t can1_ams_s12_voltages_2;
-
+struct can1_ams_cell_temperatures_t can1_ams_cell_temperatures;
 
 
 // RX structs
@@ -106,7 +127,7 @@ struct can2_ivt_msg_result_u3_t can2_ivt_msg_result_u3;
 struct can2_ivt_msg_result_as_t can2_ivt_msg_result_as;
 
 uint16_t rawVoltages[126];
-uint16_t rawTemps[126];
+uint16_t rawTemps[60];
 
 uint8_t  ovpCounter[126], ovpError = 0;
 uint8_t  uvpCounter[126], uvpError = 0;
@@ -122,6 +143,10 @@ uint8_t cellBaseNum[] = {0, 10, 21, 31, 42, 52, 63, 73, 84, 94, 105, 115};
 uint16_t command, pec, rawVoltage, rawTemp;
 uint32_t tick, lastTick = 0, deltaTick;
 
+// FSM stuff
+State_t fsmState = STATE_IDLE;
+uint32_t prechargeTimer = 0;
+uint32_t prechargeStartTime = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -130,9 +155,23 @@ static void MX_GPIO_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_CAN2_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_ADC2_Init(void);
+static void MX_ADC3_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 static void configCan1Filters(void);
 static void configCan2Filters(void);
+static void voltageConversions(void);
+static void temperatureConversions(void);
+static void voltageReadings(void);
+static void temperatureReadings(void);
+static void voltageSendCan(void);
+static void temperatureSendCan(void);
+static void readCanMessages(void);
+static void sendStatus(void);
+static void stepStateMachine(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -141,9 +180,9 @@ static void configCan2Filters(void);
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
 
@@ -172,529 +211,55 @@ int main(void)
   MX_CAN1_Init();
   MX_SPI1_Init();
   MX_CAN2_Init();
+  MX_ADC1_Init();
+  MX_ADC2_Init();
+  MX_ADC3_Init();
+  MX_TIM1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-
+  configCan1Filters();
+  configCan2Filters();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+
+  // set all output pins to the "safe" state
+  HAL_GPIO_WritePin(MCU_STATUS_LED1_GPIO_Port, MCU_STATUS_LED1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MCU_STATUS_LED2_GPIO_Port, MCU_STATUS_LED2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MCU_STATUS_LED3_GPIO_Port, MCU_STATUS_LED3_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MCU_STATUS_LED4_GPIO_Port, MCU_STATUS_LED4_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(WATCHDOG_INPUT_GPIO_Port, WATCHDOG_INPUT_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(AIR_P_ENABLE_GPIO_Port, AIR_P_ENABLE_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(AIR_N_ENABLE_GPIO_Port, AIR_N_ENABLE_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(PRECHARGE_ENABLE_GPIO_Port, PRECHARGE_ENABLE_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MCU_AMS_ERROR_N_GPIO_Port, MCU_AMS_ERROR_N_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(SC_RESET_GPIO_Port, SC_RESET_Pin, GPIO_PIN_RESET);
+
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
     tick = HAL_GetTick();
-    // Start LTC voltage conversions
-    command = MAKEBROADCASTCMD(ADCV(MD_NORMAL, DCP_NOT_PERMITTED, CH_ALL_CELLS));
-    spiTxData[0] = command >> 8;
-    spiTxData[1] = command & 0xFF;
-    pec = pec15_calc(2, spiTxData);
-    spiTxData[2] = pec >> 8;
-    spiTxData[3] = pec & 0xFF;
-    HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_RESET);
-    HAL_SPI_Transmit(&hspi1, spiTxData, 4, HAL_MAX_DELAY);
-    HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_SET);
 
-    HAL_Delay(3); // Wait for conversion to complete (3ms)
-    for (uint8_t i = 0; i < 12; i++) // foreach slave (12)
-    {
-      for (uint8_t j = 0; j < 4; j++) // foreach register (4 registers per slave)
-      {
-        switch (j)
-        {
-        case 0: // Cell voltages
-          command = MAKEADDRCMD(i, RDCVA);
-          break;
-        case 1: // Cell voltages
-          command = MAKEADDRCMD(i, RDCVB);
-          break;
-        case 2: // Cell voltages
-          command = MAKEADDRCMD(i, RDCVC);
-          break;
-        case 3: // Cell voltages
-          command = MAKEADDRCMD(i, RDCVD);
-          break;
-        }
-        spiTxData[0] = command >> 8;
-        spiTxData[1] = command & 0xFF;
-        pec = pec15_calc(2, spiTxData);
-        spiTxData[2] = pec >> 8;
-        spiTxData[3] = pec & 0xFF;
-        HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_RESET);
-        HAL_SPI_TransmitReceive(&hspi1, spiTxData, spiRxData, 4+8, HAL_MAX_DELAY);
-        HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_SET);
-        // check PEC
-        pec = (0xFF00 & (spiRxData[6] << 8)) | (0xFF & spiRxData[7]);
-        if (pec != pec15_calc(6, spiRxData))
-        {
-          spiErrorCounter[i]++;
-          if (spiErrorCounter[i] >= SPI_ERROR_COUNT_THRESHOLD)
-          {
-            spiError = 1; // Set SPI error
-          }
-          for (uint8_t k = 0; k < 4; k++)
-          {
-            rawVoltages[cellBaseNum[i] + k] = 0xFFFF; // Set to invalid value]
-          }
-        }
-        else
-        {
-          spiErrorCounter[i] = 0; // Reset error counter
+    voltageConversions();
+    HAL_Delay(3); // Wait for conversion to complete (2.3ms)
+    temperatureConversions();
+    HAL_Delay(3);
+    voltageReadings();
+    temperatureReadings();
 
-          // check how many cells we should read from this register
-          if (j == 4) // Last register
-          {
-            if (nrOfCells[i] == 10) // Last register and 10 cells
-            {
-              voltagesPerRegister = 2;
-            }
-            else // Last register and 11 cells
-            {
-              voltagesPerRegister = 3;
-            }
-          }
-          else // Not last register
-          {
-            voltagesPerRegister = 4;
-          }
-
-          for (uint8_t k = 0; k < voltagesPerRegister; k++) // foreach cell (in a register)
-          {
-            rawVoltage = (spiRxData[2*k+1] << 8) | spiRxData[2*k];
-            rawVoltages[cellBaseNum[i] + j*4 + k] = rawVoltage;
-
-            // Check for OVP and UVP
-            if (rawVoltage > OVP)
-            {
-              ovpCounter[cellBaseNum[i] + j*4 + k]++;
-              if (ovpCounter[cellBaseNum[i] + j * 4 + k] >= OVP_COUNT_THRESHOLD)
-              {
-                ovpError = 1; // Set OVP error
-              }
-            }
-            else
-            {
-              ovpCounter[cellBaseNum[i] + j*4 + k] = 0; // Reset counter
-            }
-
-            if (rawVoltage < UVP)
-            {
-              uvpCounter[cellBaseNum[i] + j*4 + k]++;
-              if (uvpCounter[cellBaseNum[i] + j * 4 + k] >= UVP_COUNT_THRESHOLD)
-              {
-                uvpError = 1; // Set UVP error
-              }
-            }
-            else
-            {
-              uvpCounter[cellBaseNum[i] + j*4 + k] = 0; // Reset counter
-            }
-          }
-        }
-      }
-
-
-    }
-
-    // Send AMS voltages
+    // send voltages and temperatures, on alternate passes
     if (cellOrTemp)
     {
-      switch (amsTxMessageCounter)
-      {
-      case 0:
-        can1_ams_s01_voltages_1.s01v01 = can1_ams_s01_voltages_1_s01v01_encode((float)rawVoltages[0] / 10000.0);
-        can1_ams_s01_voltages_1.s01v02 = can1_ams_s01_voltages_1_s01v02_encode((float)rawVoltages[1] / 10000.0);
-        can1_ams_s01_voltages_1.s01v03 = can1_ams_s01_voltages_1_s01v03_encode((float)rawVoltages[2] / 10000.0);
-        can1_ams_s01_voltages_1.s01v04 = can1_ams_s01_voltages_1_s01v04_encode((float)rawVoltages[3] / 10000.0);
-        can1_ams_s01_voltages_1.s01v05 = can1_ams_s01_voltages_1_s01v05_encode((float)rawVoltages[4] / 10000.0);
-        can1_ams_s01_voltages_1.s01v06 = can1_ams_s01_voltages_1_s01v06_encode((float)rawVoltages[5] / 10000.0);
-
-        can1_ams_s01_voltages_1_pack(txData, &can1_ams_s01_voltages_1, CAN1_AMS_S01_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S01_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S01_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 1:
-        can1_ams_s01_voltages_2.s01v07 = can1_ams_s01_voltages_2_s01v07_encode((float) rawVoltages[6] / 10000.0);
-        can1_ams_s01_voltages_2.s01v08 = can1_ams_s01_voltages_2_s01v08_encode((float) rawVoltages[7] / 10000.0);
-        can1_ams_s01_voltages_2.s01v09 = can1_ams_s01_voltages_2_s01v09_encode((float) rawVoltages[8] / 10000.0);
-        can1_ams_s01_voltages_2.s01v10 = can1_ams_s01_voltages_2_s01v10_encode((float) rawVoltages[9] / 10000.0);
-        can1_ams_s01_voltages_2.s01v11 = can1_ams_s01_voltages_2_s01v11_encode((float) rawVoltages[10] / 10000.0);
-
-        can1_ams_s01_voltages_2_pack(txData, &can1_ams_s01_voltages_2, CAN1_AMS_S01_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S01_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S01_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 2:
-        can1_ams_s02_voltages_1.s02v01 = can1_ams_s02_voltages_1_s02v01_encode((float) rawVoltages[11] / 10000.0);
-        can1_ams_s02_voltages_1.s02v02 = can1_ams_s02_voltages_1_s02v02_encode((float) rawVoltages[12] / 10000.0);
-        can1_ams_s02_voltages_1.s02v03 = can1_ams_s02_voltages_1_s02v03_encode((float) rawVoltages[13] / 10000.0);
-        can1_ams_s02_voltages_1.s02v04 = can1_ams_s02_voltages_1_s02v04_encode((float) rawVoltages[14] / 10000.0);
-        can1_ams_s02_voltages_1.s02v05 = can1_ams_s02_voltages_1_s02v05_encode((float) rawVoltages[15] / 10000.0);
-        can1_ams_s02_voltages_1.s02v06 = can1_ams_s02_voltages_1_s02v06_encode((float) rawVoltages[16] / 10000.0);
-
-        can1_ams_s02_voltages_1_pack(txData, &can1_ams_s02_voltages_1, CAN1_AMS_S02_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S02_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S02_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 3:
-        can1_ams_s02_voltages_2.s02v07 = can1_ams_s02_voltages_2_s02v07_encode((float) rawVoltages[17] / 10000.0);
-        can1_ams_s02_voltages_2.s02v08 = can1_ams_s02_voltages_2_s02v08_encode((float) rawVoltages[18] / 10000.0);
-        can1_ams_s02_voltages_2.s02v09 = can1_ams_s02_voltages_2_s02v09_encode((float) rawVoltages[19] / 10000.0);
-        can1_ams_s02_voltages_2.s02v10 = can1_ams_s02_voltages_2_s02v10_encode((float) rawVoltages[20] / 10000.0);
-
-        can1_ams_s02_voltages_2_pack(txData, &can1_ams_s02_voltages_2, CAN1_AMS_S02_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S02_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S02_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 4:
-        can1_ams_s03_voltages_1.s03v01 = can1_ams_s03_voltages_1_s03v01_encode((float) rawVoltages[21] / 10000.0);
-        can1_ams_s03_voltages_1.s03v02 = can1_ams_s03_voltages_1_s03v02_encode((float) rawVoltages[22] / 10000.0);
-        can1_ams_s03_voltages_1.s03v03 = can1_ams_s03_voltages_1_s03v03_encode((float) rawVoltages[23] / 10000.0);
-        can1_ams_s03_voltages_1.s03v04 = can1_ams_s03_voltages_1_s03v04_encode((float) rawVoltages[24] / 10000.0);
-        can1_ams_s03_voltages_1.s03v05 = can1_ams_s03_voltages_1_s03v05_encode((float) rawVoltages[25] / 10000.0);
-        can1_ams_s03_voltages_1.s03v06 = can1_ams_s03_voltages_1_s03v06_encode((float) rawVoltages[26] / 10000.0);
-
-        can1_ams_s03_voltages_1_pack(txData, &can1_ams_s03_voltages_1, CAN1_AMS_S03_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S03_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S03_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 5:
-        can1_ams_s03_voltages_2.s03v07 = can1_ams_s03_voltages_2_s03v07_encode((float) rawVoltages[27] / 10000.0);
-        can1_ams_s03_voltages_2.s03v08 = can1_ams_s03_voltages_2_s03v08_encode((float) rawVoltages[28] / 10000.0);
-        can1_ams_s03_voltages_2.s03v09 = can1_ams_s03_voltages_2_s03v09_encode((float) rawVoltages[29] / 10000.0);
-        can1_ams_s03_voltages_2.s03v10 = can1_ams_s03_voltages_2_s03v10_encode((float) rawVoltages[30] / 10000.0);
-        can1_ams_s03_voltages_2.s03v11 = can1_ams_s03_voltages_2_s03v11_encode((float) rawVoltages[31] / 10000.0);
-
-        can1_ams_s03_voltages_2_pack(txData, &can1_ams_s03_voltages_2, CAN1_AMS_S03_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S03_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S03_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 6:
-        can1_ams_s04_voltages_1.s04v01 = can1_ams_s04_voltages_1_s04v01_encode((float) rawVoltages[32] / 10000.0);
-        can1_ams_s04_voltages_1.s04v02 = can1_ams_s04_voltages_1_s04v02_encode((float) rawVoltages[33] / 10000.0);
-        can1_ams_s04_voltages_1.s04v03 = can1_ams_s04_voltages_1_s04v03_encode((float) rawVoltages[34] / 10000.0);
-        can1_ams_s04_voltages_1.s04v04 = can1_ams_s04_voltages_1_s04v04_encode((float) rawVoltages[35] / 10000.0);
-        can1_ams_s04_voltages_1.s04v05 = can1_ams_s04_voltages_1_s04v05_encode((float) rawVoltages[36] / 10000.0);
-        can1_ams_s04_voltages_1.s04v06 = can1_ams_s04_voltages_1_s04v06_encode((float) rawVoltages[37] / 10000.0);
-
-        can1_ams_s04_voltages_1_pack(txData, &can1_ams_s04_voltages_1, CAN1_AMS_S04_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S04_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S04_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 7:
-        can1_ams_s04_voltages_2.s04v07 = can1_ams_s04_voltages_2_s04v07_encode((float) rawVoltages[38] / 10000.0);
-        can1_ams_s04_voltages_2.s04v08 = can1_ams_s04_voltages_2_s04v08_encode((float) rawVoltages[39] / 10000.0);
-        can1_ams_s04_voltages_2.s04v09 = can1_ams_s04_voltages_2_s04v09_encode((float) rawVoltages[40] / 10000.0);
-        can1_ams_s04_voltages_2.s04v10 = can1_ams_s04_voltages_2_s04v10_encode((float) rawVoltages[41] / 10000.0);
-
-        can1_ams_s04_voltages_2_pack(txData, &can1_ams_s04_voltages_2, CAN1_AMS_S04_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S04_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S04_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 8:
-        can1_ams_s05_voltages_1.s05v01 = can1_ams_s05_voltages_1_s05v01_encode((float) rawVoltages[42] / 10000.0);
-        can1_ams_s05_voltages_1.s05v02 = can1_ams_s05_voltages_1_s05v02_encode((float) rawVoltages[43] / 10000.0);
-        can1_ams_s05_voltages_1.s05v03 = can1_ams_s05_voltages_1_s05v03_encode((float) rawVoltages[44] / 10000.0);
-        can1_ams_s05_voltages_1.s05v04 = can1_ams_s05_voltages_1_s05v04_encode((float) rawVoltages[45] / 10000.0);
-        can1_ams_s05_voltages_1.s05v05 = can1_ams_s05_voltages_1_s05v05_encode((float) rawVoltages[46] / 10000.0);
-        can1_ams_s05_voltages_1.s05v06 = can1_ams_s05_voltages_1_s05v06_encode((float) rawVoltages[47] / 10000.0);
-
-        can1_ams_s05_voltages_1_pack(txData, &can1_ams_s05_voltages_1, CAN1_AMS_S05_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S05_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S05_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 9:
-        can1_ams_s05_voltages_2.s05v07 = can1_ams_s05_voltages_2_s05v07_encode((float) rawVoltages[48] / 10000.0);
-        can1_ams_s05_voltages_2.s05v08 = can1_ams_s05_voltages_2_s05v08_encode((float) rawVoltages[49] / 10000.0);
-        can1_ams_s05_voltages_2.s05v09 = can1_ams_s05_voltages_2_s05v09_encode((float) rawVoltages[50] / 10000.0);
-        can1_ams_s05_voltages_2.s05v10 = can1_ams_s05_voltages_2_s05v10_encode((float) rawVoltages[51] / 10000.0);
-        can1_ams_s05_voltages_2.s05v11 = can1_ams_s05_voltages_2_s05v11_encode((float) rawVoltages[52] / 10000.0);
-
-        can1_ams_s05_voltages_2_pack(txData, &can1_ams_s05_voltages_2, CAN1_AMS_S05_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S05_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S05_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 10:
-        can1_ams_s06_voltages_1.s06v01 = can1_ams_s06_voltages_1_s06v01_encode((float) rawVoltages[53] / 10000.0);
-        can1_ams_s06_voltages_1.s06v02 = can1_ams_s06_voltages_1_s06v02_encode((float) rawVoltages[54] / 10000.0);
-        can1_ams_s06_voltages_1.s06v03 = can1_ams_s06_voltages_1_s06v03_encode((float) rawVoltages[55] / 10000.0);
-        can1_ams_s06_voltages_1.s06v04 = can1_ams_s06_voltages_1_s06v04_encode((float) rawVoltages[56] / 10000.0);
-        can1_ams_s06_voltages_1.s06v05 = can1_ams_s06_voltages_1_s06v05_encode((float) rawVoltages[57] / 10000.0);
-        can1_ams_s06_voltages_1.s06v06 = can1_ams_s06_voltages_1_s06v06_encode((float) rawVoltages[58] / 10000.0);
-
-        can1_ams_s06_voltages_1_pack(txData, &can1_ams_s06_voltages_1, CAN1_AMS_S06_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S06_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S06_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 11:
-        can1_ams_s06_voltages_2.s06v07 = can1_ams_s06_voltages_2_s06v07_encode((float) rawVoltages[59] / 10000.0);
-        can1_ams_s06_voltages_2.s06v08 = can1_ams_s06_voltages_2_s06v08_encode((float) rawVoltages[60] / 10000.0);
-        can1_ams_s06_voltages_2.s06v09 = can1_ams_s06_voltages_2_s06v09_encode((float) rawVoltages[61] / 10000.0);
-        can1_ams_s06_voltages_2.s06v10 = can1_ams_s06_voltages_2_s06v10_encode((float) rawVoltages[62] / 10000.0);
-
-        can1_ams_s06_voltages_2_pack(txData, &can1_ams_s06_voltages_2, CAN1_AMS_S06_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S06_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S06_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 12:
-        can1_ams_s07_voltages_1.s07v01 = can1_ams_s07_voltages_1_s07v01_encode((float) rawVoltages[63] / 10000.0);
-        can1_ams_s07_voltages_1.s07v02 = can1_ams_s07_voltages_1_s07v02_encode((float) rawVoltages[64] / 10000.0);
-        can1_ams_s07_voltages_1.s07v03 = can1_ams_s07_voltages_1_s07v03_encode((float) rawVoltages[65] / 10000.0);
-        can1_ams_s07_voltages_1.s07v04 = can1_ams_s07_voltages_1_s07v04_encode((float) rawVoltages[66] / 10000.0);
-        can1_ams_s07_voltages_1.s07v05 = can1_ams_s07_voltages_1_s07v05_encode((float) rawVoltages[67] / 10000.0);
-        can1_ams_s07_voltages_1.s07v06 = can1_ams_s07_voltages_1_s07v06_encode((float) rawVoltages[68] / 10000.0);
-
-        can1_ams_s07_voltages_1_pack(txData, &can1_ams_s07_voltages_1, CAN1_AMS_S07_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S07_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S07_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 13:
-        can1_ams_s07_voltages_2.s07v07 = can1_ams_s07_voltages_2_s07v07_encode((float) rawVoltages[69] / 10000.0);
-        can1_ams_s07_voltages_2.s07v08 = can1_ams_s07_voltages_2_s07v08_encode((float) rawVoltages[70] / 10000.0);
-        can1_ams_s07_voltages_2.s07v09 = can1_ams_s07_voltages_2_s07v09_encode((float) rawVoltages[71] / 10000.0);
-        can1_ams_s07_voltages_2.s07v10 = can1_ams_s07_voltages_2_s07v10_encode((float) rawVoltages[72] / 10000.0);
-        can1_ams_s07_voltages_2.s07v11 = can1_ams_s07_voltages_2_s07v11_encode((float) rawVoltages[73] / 10000.0);
-
-        can1_ams_s07_voltages_2_pack(txData, &can1_ams_s07_voltages_2, CAN1_AMS_S07_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S07_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S07_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 14:
-        can1_ams_s08_voltages_1.s08v01 = can1_ams_s08_voltages_1_s08v01_encode((float) rawVoltages[74] / 10000.0);
-        can1_ams_s08_voltages_1.s08v02 = can1_ams_s08_voltages_1_s08v02_encode((float) rawVoltages[75] / 10000.0);
-        can1_ams_s08_voltages_1.s08v03 = can1_ams_s08_voltages_1_s08v03_encode((float) rawVoltages[76] / 10000.0);
-        can1_ams_s08_voltages_1.s08v04 = can1_ams_s08_voltages_1_s08v04_encode((float) rawVoltages[77] / 10000.0);
-        can1_ams_s08_voltages_1.s08v05 = can1_ams_s08_voltages_1_s08v05_encode((float) rawVoltages[78] / 10000.0);
-        can1_ams_s08_voltages_1.s08v06 = can1_ams_s08_voltages_1_s08v06_encode((float) rawVoltages[79] / 10000.0);
-
-        can1_ams_s08_voltages_1_pack(txData, &can1_ams_s08_voltages_1, CAN1_AMS_S08_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S08_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S08_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 15:
-        can1_ams_s08_voltages_2.s08v07 = can1_ams_s08_voltages_2_s08v07_encode((float) rawVoltages[80] / 10000.0);
-        can1_ams_s08_voltages_2.s08v08 = can1_ams_s08_voltages_2_s08v08_encode((float) rawVoltages[81] / 10000.0);
-        can1_ams_s08_voltages_2.s08v09 = can1_ams_s08_voltages_2_s08v09_encode((float) rawVoltages[82] / 10000.0);
-        can1_ams_s08_voltages_2.s08v10 = can1_ams_s08_voltages_2_s08v10_encode((float) rawVoltages[83] / 10000.0);
-
-        can1_ams_s08_voltages_2_pack(txData, &can1_ams_s08_voltages_2, CAN1_AMS_S08_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S08_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S08_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 16:
-        can1_ams_s09_voltages_1.s09v01 = can1_ams_s09_voltages_1_s09v01_encode((float) rawVoltages[84] / 10000.0);
-        can1_ams_s09_voltages_1.s09v02 = can1_ams_s09_voltages_1_s09v02_encode((float) rawVoltages[85] / 10000.0);
-        can1_ams_s09_voltages_1.s09v03 = can1_ams_s09_voltages_1_s09v03_encode((float) rawVoltages[86] / 10000.0);
-        can1_ams_s09_voltages_1.s09v04 = can1_ams_s09_voltages_1_s09v04_encode((float) rawVoltages[87] / 10000.0);
-        can1_ams_s09_voltages_1.s09v05 = can1_ams_s09_voltages_1_s09v05_encode((float) rawVoltages[88] / 10000.0);
-        can1_ams_s09_voltages_1.s09v06 = can1_ams_s09_voltages_1_s09v06_encode((float) rawVoltages[89] / 10000.0);
-
-        can1_ams_s09_voltages_1_pack(txData, &can1_ams_s09_voltages_1, CAN1_AMS_S09_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S09_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S09_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 17:
-        can1_ams_s09_voltages_2.s09v07 = can1_ams_s09_voltages_2_s09v07_encode((float) rawVoltages[90] / 10000.0);
-        can1_ams_s09_voltages_2.s09v08 = can1_ams_s09_voltages_2_s09v08_encode((float) rawVoltages[91] / 10000.0);
-        can1_ams_s09_voltages_2.s09v09 = can1_ams_s09_voltages_2_s09v09_encode((float) rawVoltages[92] / 10000.0);
-        can1_ams_s09_voltages_2.s09v10 = can1_ams_s09_voltages_2_s09v10_encode((float) rawVoltages[93] / 10000.0);
-        can1_ams_s09_voltages_2.s09v11 = can1_ams_s09_voltages_2_s09v11_encode((float) rawVoltages[94] / 10000.0);
-
-        can1_ams_s09_voltages_2_pack(txData, &can1_ams_s09_voltages_2, CAN1_AMS_S09_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S09_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S09_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 18:
-        can1_ams_s10_voltages_1.s10v01 = can1_ams_s10_voltages_1_s10v01_encode((float) rawVoltages[95] / 10000.0);
-        can1_ams_s10_voltages_1.s10v02 = can1_ams_s10_voltages_1_s10v02_encode((float) rawVoltages[96] / 10000.0);
-        can1_ams_s10_voltages_1.s10v03 = can1_ams_s10_voltages_1_s10v03_encode((float) rawVoltages[97] / 10000.0);
-        can1_ams_s10_voltages_1.s10v04 = can1_ams_s10_voltages_1_s10v04_encode((float) rawVoltages[98] / 10000.0);
-        can1_ams_s10_voltages_1.s10v05 = can1_ams_s10_voltages_1_s10v05_encode((float) rawVoltages[99] / 10000.0);
-        can1_ams_s10_voltages_1.s10v06 = can1_ams_s10_voltages_1_s10v06_encode((float) rawVoltages[100] / 10000.0);
-
-        can1_ams_s10_voltages_1_pack(txData, &can1_ams_s10_voltages_1, CAN1_AMS_S10_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S10_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S10_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 19:
-        can1_ams_s10_voltages_2.s10v07 = can1_ams_s10_voltages_2_s10v07_encode((float) rawVoltages[101] / 10000.0);
-        can1_ams_s10_voltages_2.s10v08 = can1_ams_s10_voltages_2_s10v08_encode((float) rawVoltages[102] / 10000.0);
-        can1_ams_s10_voltages_2.s10v09 = can1_ams_s10_voltages_2_s10v09_encode((float) rawVoltages[103] / 10000.0);
-        can1_ams_s10_voltages_2.s10v10 = can1_ams_s10_voltages_2_s10v10_encode((float) rawVoltages[104] / 10000.0);
-
-        can1_ams_s10_voltages_2_pack(txData, &can1_ams_s10_voltages_2, CAN1_AMS_S10_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S10_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S10_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 20:
-        can1_ams_s11_voltages_1.s11v01 = can1_ams_s11_voltages_1_s11v01_encode((float) rawVoltages[105] / 10000.0);
-        can1_ams_s11_voltages_1.s11v02 = can1_ams_s11_voltages_1_s11v02_encode((float) rawVoltages[106] / 10000.0);
-        can1_ams_s11_voltages_1.s11v03 = can1_ams_s11_voltages_1_s11v03_encode((float) rawVoltages[107] / 10000.0);
-        can1_ams_s11_voltages_1.s11v04 = can1_ams_s11_voltages_1_s11v04_encode((float) rawVoltages[108] / 10000.0);
-        can1_ams_s11_voltages_1.s11v05 = can1_ams_s11_voltages_1_s11v05_encode((float) rawVoltages[109] / 10000.0);
-        can1_ams_s11_voltages_1.s11v06 = can1_ams_s11_voltages_1_s11v06_encode((float) rawVoltages[110] / 10000.0);
-
-        can1_ams_s11_voltages_1_pack(txData, &can1_ams_s11_voltages_1, CAN1_AMS_S11_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S11_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S11_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 21:
-        can1_ams_s11_voltages_2.s11v07 = can1_ams_s11_voltages_2_s11v07_encode((float) rawVoltages[111] / 10000.0);
-        can1_ams_s11_voltages_2.s11v08 = can1_ams_s11_voltages_2_s11v08_encode((float) rawVoltages[112] / 10000.0);
-        can1_ams_s11_voltages_2.s11v09 = can1_ams_s11_voltages_2_s11v09_encode((float) rawVoltages[113] / 10000.0);
-        can1_ams_s11_voltages_2.s11v10 = can1_ams_s11_voltages_2_s11v10_encode((float) rawVoltages[114] / 10000.0);
-        can1_ams_s11_voltages_2.s11v11 = can1_ams_s11_voltages_2_s11v11_encode((float) rawVoltages[115] / 10000.0);
-
-        can1_ams_s11_voltages_2_pack(txData, &can1_ams_s11_voltages_2, CAN1_AMS_S11_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S11_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S11_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 22:
-        can1_ams_s12_voltages_1.s12v01 = can1_ams_s12_voltages_1_s12v01_encode((float) rawVoltages[116] / 10000.0);
-        can1_ams_s12_voltages_1.s12v02 = can1_ams_s12_voltages_1_s12v02_encode((float) rawVoltages[117] / 10000.0);
-        can1_ams_s12_voltages_1.s12v03 = can1_ams_s12_voltages_1_s12v03_encode((float) rawVoltages[118] / 10000.0);
-        can1_ams_s12_voltages_1.s12v04 = can1_ams_s12_voltages_1_s12v04_encode((float) rawVoltages[119] / 10000.0);
-        can1_ams_s12_voltages_1.s12v05 = can1_ams_s12_voltages_1_s12v05_encode((float) rawVoltages[120] / 10000.0);
-        can1_ams_s12_voltages_1.s12v06 = can1_ams_s12_voltages_1_s12v06_encode((float) rawVoltages[121] / 10000.0);
-
-        can1_ams_s12_voltages_1_pack(txData, &can1_ams_s12_voltages_1, CAN1_AMS_S12_VOLTAGES_1_LENGTH);
-        txHeader.StdId = CAN1_AMS_S12_VOLTAGES_1_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S12_VOLTAGES_1_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-
-      case 23:
-        can1_ams_s12_voltages_2.s12v07 = can1_ams_s12_voltages_2_s12v07_encode((float) rawVoltages[122] / 10000.0);
-        can1_ams_s12_voltages_2.s12v08 = can1_ams_s12_voltages_2_s12v08_encode((float) rawVoltages[123] / 10000.0);
-        can1_ams_s12_voltages_2.s12v09 = can1_ams_s12_voltages_2_s12v09_encode((float) rawVoltages[124] / 10000.0);
-        can1_ams_s12_voltages_2.s12v10 = can1_ams_s12_voltages_2_s12v10_encode((float) rawVoltages[125] / 10000.0);
-
-        can1_ams_s12_voltages_2_pack(txData, &can1_ams_s12_voltages_2, CAN1_AMS_S12_VOLTAGES_2_LENGTH);
-        txHeader.StdId = CAN1_AMS_S12_VOLTAGES_2_FRAME_ID;
-        txHeader.DLC = CAN1_AMS_S12_VOLTAGES_2_LENGTH;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-          Error_Handler();
-        break;
-      }
+      voltageSendCan();
+      if (++amsTxMessageCounter >= 24)
+        amsTxMessageCounter = 0; // Reset counter after sending all messages
     }
     else // Temperatures
     {
-
+      temperatureSendCan();
     }
     cellOrTemp = !cellOrTemp; // Toggle between cells and temperatures on each pass
 
@@ -702,115 +267,35 @@ int main(void)
     // TODO: Consider moving this to an interrupt if IVT messages are more frequent and FIFO overflows
     // In general IVT overflows should not matter much since we will read the latest message
     // read can 1
-    while (HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0)
-    {
-      if (HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &rxHeader, rxData) != HAL_OK)
-      {
-        Error_Handler();
-      }
+    readCanMessages();
 
-      // Process the received message based on its ID
-      switch (rxHeader.StdId)
-      {
-      case CAN1_DBU_STATUS_1_FRAME_ID:
-        can1_dbu_status_1_unpack(&can1_dbu_status_1, rxData, CAN1_DBU_STATUS_1_LENGTH);
-        break;
-      case CAN1_ECU_STATUS_FRAME_ID:
-        can1_ecu_status_unpack(&can1_ecu_status, rxData, CAN1_ECU_STATUS_LENGTH);
-        break;
-      case CAN1_AMS_PARAMETERS_SET_FRAME_ID:
-        can1_ams_parameters_set_unpack(&can1_ams_parameters_set, rxData, CAN1_AMS_PARAMETERS_SET_LENGTH);
-        break;
-      default:
-        // Unknown ID, handle if necessary
-        break;
-      }
-    }
+    stepStateMachine();
 
-    // Read CAN2
-    while (HAL_CAN_GetRxFifoFillLevel(&hcan2, CAN_RX_FIFO0) > 0)
-    {
-      if (HAL_CAN_GetRxMessage(&hcan2, CAN_RX_FIFO0, &rxHeader, rxData) != HAL_OK)
-      {
-        Error_Handler();
-      }
-
-      // Process the received message based on its ID
-      switch (rxHeader.StdId)
-      {
-      case CAN2_IVT_MSG_RESULT_U2_FRAME_ID:
-        can2_ivt_msg_result_u2_unpack(&can2_ivt_msg_result_u2, rxData, CAN2_IVT_MSG_RESULT_U2_LENGTH);
-        break;
-      case CAN2_IVT_MSG_RESULT_U1_FRAME_ID:
-        can2_ivt_msg_result_u1_unpack(&can2_ivt_msg_result_u1, rxData, CAN2_IVT_MSG_RESULT_U1_LENGTH);
-        break;
-      case CAN2_IVT_MSG_RESULT_T_FRAME_ID:
-        can2_ivt_msg_result_t_unpack(&can2_ivt_msg_result_t, rxData, CAN2_IVT_MSG_RESULT_T_LENGTH);
-        break;
-      case CAN2_IVT_MSG_RESULT_W_FRAME_ID:
-        can2_ivt_msg_result_w_unpack(&can2_ivt_msg_result_w, rxData, CAN2_IVT_MSG_RESULT_W_LENGTH);
-        break;
-      case CAN2_IVT_MSG_RESULT_WH_FRAME_ID:
-        can2_ivt_msg_result_wh_unpack(&can2_ivt_msg_result_wh, rxData, CAN2_IVT_MSG_RESULT_WH_LENGTH);
-        break;
-      case CAN2_IVT_MSG_RESULT_I_FRAME_ID:
-        can2_ivt_msg_result_i_unpack(&can2_ivt_msg_result_i, rxData, CAN2_IVT_MSG_RESULT_I_LENGTH);
-        break;
-      case CAN2_IVT_MSG_RESULT_U3_FRAME_ID:
-        can2_ivt_msg_result_u3_unpack(&can2_ivt_msg_result_u3, rxData, CAN2_IVT_MSG_RESULT_U3_LENGTH);
-        break;
-      case CAN2_IVT_MSG_RESULT_AS_FRAME_ID:
-        can2_ivt_msg_result_as_unpack(&can2_ivt_msg_result_as, rxData, CAN2_IVT_MSG_RESULT_AS_LENGTH);
-        break;
-      default:
-        // Unknown ID, handle if necessary
-        break;
-      }
-    }
-
-    // find max and min voltages
-    uint16_t maxVoltage = 0;
-    uint16_t minVoltage = 0xFFFF;
-    for (int i = 0; i < 126; i++)
-    {
-      if (rawVoltages[i] > maxVoltage)
-        maxVoltage = rawVoltages[i];
-      if (rawVoltages[i] < minVoltage)
-        minVoltage = rawVoltages[i];
-    }
-    can1_ams_status_1.max_cell_voltage = can1_ams_status_1_max_cell_voltage_encode((float) maxVoltage / 10000.0);
-    can1_ams_status_1.min_cell_voltage = can1_ams_status_1_min_cell_voltage_encode((float) minVoltage / 10000.0);
-
+    // find max and min voltages and temperatures
     deltaTick = HAL_GetTick() - tick;
-    can1_ams_status_1.ticks = can1_ams_status_1_ticks_encode(deltaTick);
-    can1_ams_status_1_pack(txData, &can1_ams_status_1, CAN1_AMS_STATUS_1_LENGTH);
-    txHeader.StdId = CAN1_AMS_STATUS_1_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_STATUS_1_LENGTH;
-    txHeader.IDE = CAN_ID_STD;
-    txHeader.RTR = CAN_RTR_DATA;
-    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
-      Error_Handler();
+    sendStatus();
+
   }
   /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-   */
+  */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
-   */
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -826,9 +311,9 @@ void SystemClock_Config(void)
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-   */
+  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-      |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
@@ -841,10 +326,166 @@ void SystemClock_Config(void)
 }
 
 /**
- * @brief CAN1 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_10;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief ADC2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC2_Init(void)
+{
+
+  /* USER CODE BEGIN ADC2_Init 0 */
+
+  /* USER CODE END ADC2_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC2_Init 1 */
+
+  /* USER CODE END ADC2_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc2.Instance = ADC2;
+  hadc2.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc2.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc2.Init.ScanConvMode = DISABLE;
+  hadc2.Init.ContinuousConvMode = DISABLE;
+  hadc2.Init.DiscontinuousConvMode = DISABLE;
+  hadc2.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc2.Init.NbrOfConversion = 1;
+  hadc2.Init.DMAContinuousRequests = DISABLE;
+  hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_11;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC2_Init 2 */
+
+  /* USER CODE END ADC2_Init 2 */
+
+}
+
+/**
+  * @brief ADC3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC3_Init(void)
+{
+
+  /* USER CODE BEGIN ADC3_Init 0 */
+
+  /* USER CODE END ADC3_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC3_Init 1 */
+
+  /* USER CODE END ADC3_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc3.Instance = ADC3;
+  hadc3.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc3.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc3.Init.ScanConvMode = DISABLE;
+  hadc3.Init.ContinuousConvMode = DISABLE;
+  hadc3.Init.DiscontinuousConvMode = DISABLE;
+  hadc3.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc3.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc3.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc3.Init.NbrOfConversion = 1;
+  hadc3.Init.DMAContinuousRequests = DISABLE;
+  hadc3.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_13;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC3_Init 2 */
+
+  /* USER CODE END ADC3_Init 2 */
+
+}
+
+/**
+  * @brief CAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_CAN1_Init(void)
 {
 
@@ -878,10 +519,10 @@ static void MX_CAN1_Init(void)
 }
 
 /**
- * @brief CAN2 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief CAN2 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_CAN2_Init(void)
 {
 
@@ -915,10 +556,10 @@ static void MX_CAN2_Init(void)
 }
 
 /**
- * @brief SPI1 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_SPI1_Init(void)
 {
 
@@ -953,10 +594,123 @@ static void MX_SPI1_Init(void)
 }
 
 /**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- */
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4294967295;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_IC_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -967,29 +721,77 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOE, MCU_STATUS_LED1_Pin|MCU_STATUS_LED2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOE, MCU_STATUS_LED1_Pin|MCU_STATUS_LED2_Pin|WATCHDOG_INPUT_Pin|AIR_P_ENABLE_Pin
+                          |PRECHARGE_ENABLE_Pin|AIR_N_ENABLE_Pin|SC_RESET_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, SPI1_SSN_Pin|MCU_STATUS_LED3_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : MCU_STATUS_LED1_Pin MCU_STATUS_LED2_Pin */
-  GPIO_InitStruct.Pin = MCU_STATUS_LED1_Pin|MCU_STATUS_LED2_Pin;
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(MCU_STATUS_LED4_GPIO_Port, MCU_STATUS_LED4_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, MCU_AMS_ERROR_N_Pin|RST_OUT_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : MCU_STATUS_LED1_Pin MCU_STATUS_LED2_Pin WATCHDOG_INPUT_Pin AIR_P_ENABLE_Pin
+                           PRECHARGE_ENABLE_Pin AIR_N_ENABLE_Pin SC_RESET_Pin */
+  GPIO_InitStruct.Pin = MCU_STATUS_LED1_Pin|MCU_STATUS_LED2_Pin|WATCHDOG_INPUT_Pin|AIR_P_ENABLE_Pin
+                          |PRECHARGE_ENABLE_Pin|AIR_N_ENABLE_Pin|SC_RESET_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : SPI1_SSN_Pin */
-  GPIO_InitStruct.Pin = SPI1_SSN_Pin;
+  /*Configure GPIO pins : SPI1_SSN_Pin MCU_STATUS_LED3_Pin */
+  GPIO_InitStruct.Pin = SPI1_SSN_Pin|MCU_STATUS_LED3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(SPI1_SSN_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : MCU_STATUS_LED4_Pin */
+  GPIO_InitStruct.Pin = MCU_STATUS_LED4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(MCU_STATUS_LED4_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : AMS_ERROR_LATCHED_Pin */
+  GPIO_InitStruct.Pin = AMS_ERROR_LATCHED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(AMS_ERROR_LATCHED_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : AIR_N_CLOSED_Pin AIR_P_CLOSED_Pin IMD_ERROR_LATCHED_Pin */
+  GPIO_InitStruct.Pin = AIR_N_CLOSED_Pin|AIR_P_CLOSED_Pin|IMD_ERROR_LATCHED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : MCU_AMS_ERROR_N_Pin RST_OUT_Pin */
+  GPIO_InitStruct.Pin = MCU_AMS_ERROR_N_Pin|RST_OUT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PRECHARGE_CLOSED_SIGNAL_Pin */
+  GPIO_InitStruct.Pin = PRECHARGE_CLOSED_SIGNAL_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(PRECHARGE_CLOSED_SIGNAL_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SC_PROBE_Pin */
+  GPIO_InitStruct.Pin = SC_PROBE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(SC_PROBE_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -1045,12 +847,1067 @@ static void configCan2Filters(void) {
     Error_Handler();
   }
 }
+
+static void voltageConversions(void)
+{
+  command = MAKEBROADCASTCMD(ADCV(MD_NORMAL, DCP_NOT_PERMITTED, CH_ALL_CELLS));
+  spiTxData[0] = command >> 8;
+  spiTxData[1] = command & 0xFF;
+  pec = pec15_calc(2, spiTxData);
+  spiTxData[2] = pec >> 8;
+  spiTxData[3] = pec & 0xFF;
+  HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_RESET);
+  HAL_SPI_Transmit(&hspi1, spiTxData, 4, HAL_MAX_DELAY);
+  HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_SET);
+}
+
+static void temperatureConversions(void)
+{
+  command = MAKEBROADCASTCMD(ADAX(MD_NORMAL, CH_ALL_CELLS));
+  spiTxData[0] = command >> 8;
+  spiTxData[1] = command & 0xFF;
+  pec = pec15_calc(2, spiTxData);
+  spiTxData[2] = pec >> 8;
+  spiTxData[3] = pec & 0xFF;
+  HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_RESET);
+  HAL_SPI_Transmit(&hspi1, spiTxData, 4, HAL_MAX_DELAY);
+  HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_SET);
+}
+
+static void voltageReadings(void)
+{
+  for (uint8_t i = 0; i < 12; i++) // foreach slave (12)
+  {
+    for (uint8_t j = 0; j < 4; j++) // foreach register (4 registers per slave)
+    {
+      switch (j)
+      {
+      case 0: // Cell voltages
+        command = MAKEADDRCMD(i, RDCVA);
+        break;
+      case 1: // Cell voltages
+        command = MAKEADDRCMD(i, RDCVB);
+        break;
+      case 2: // Cell voltages
+        command = MAKEADDRCMD(i, RDCVC);
+        break;
+      case 3: // Cell voltages
+        command = MAKEADDRCMD(i, RDCVD);
+        break;
+      }
+      spiTxData[0] = command >> 8;
+      spiTxData[1] = command & 0xFF;
+      pec = pec15_calc(2, spiTxData);
+      spiTxData[2] = pec >> 8;
+      spiTxData[3] = pec & 0xFF;
+      HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, spiTxData, spiRxData, 4+8, HAL_MAX_DELAY);
+      HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_SET);
+      // check PEC
+      pec = (0xFF00 & (spiRxData[6] << 8)) | (0xFF & spiRxData[7]);
+      if (pec != pec15_calc(6, spiRxData))
+      {
+        spiErrorCounter[i]++;
+        if (spiErrorCounter[i] >= SPI_ERROR_COUNT_THRESHOLD)
+        {
+          spiError = 1; // Set SPI error
+        }
+        for (uint8_t k = 0; k < 4; k++)
+        {
+          rawVoltages[cellBaseNum[i] + k] = 0xFFFF; // Set to invalid value]
+        }
+      }
+      else
+      {
+        spiErrorCounter[i] = 0; // Reset error counter
+
+        // check how many cells we should read from this register
+        if (j == 4) // Last register
+        {
+          if (nrOfCells[i] == 10) // Last register and 10 cells
+          {
+            voltagesPerRegister = 1;
+          }
+          else // Last register and 11 cells
+          {
+            voltagesPerRegister = 2;
+          }
+        }
+        else // Not last register
+        {
+          voltagesPerRegister = 3;
+        }
+
+        for (uint8_t k = 0; k < voltagesPerRegister; k++) // foreach cell (in a register)
+        {
+          rawVoltage = (spiRxData[2 * k + 1] << 8) | spiRxData[2*k];
+          rawVoltages[cellBaseNum[i] + j * 4 + k] = rawVoltage;
+
+          // Check for OVP and UVP
+          if (rawVoltage > OVP)
+          {
+            ovpCounter[cellBaseNum[i] + j * 4 + k]++;
+            if (ovpCounter[cellBaseNum[i] + j * 4 + k] >= OVP_COUNT_THRESHOLD)
+            {
+              ovpError = 1; // Set OVP error
+            }
+          }
+          else
+          {
+            ovpCounter[cellBaseNum[i] + j * 4 + k] = 0; // Reset counter
+          }
+
+          if (rawVoltage < UVP)
+          {
+            uvpCounter[cellBaseNum[i] + j * 4 + k]++;
+            if (uvpCounter[cellBaseNum[i] + j * 4 + k] >= UVP_COUNT_THRESHOLD)
+            {
+              uvpError = 1; // Set UVP error
+            }
+          }
+          else
+          {
+            uvpCounter[cellBaseNum[i] + j * 4 + k] = 0; // Reset counter
+          }
+        } // End foreach cell in register
+      } // End check PEC
+    } // End foreach register
+  } // End foreach slave
+}
+
+static void temperatureReadings(void)
+{
+  for (uint8_t i = 0; i < 12; i++) // foreach slave (12)
+  {
+    for (uint8_t j = 0; j < 2; j++) // foreach register (2 registers per slave)
+    {
+      switch (j)
+      {
+      case 0:
+        command = MAKEADDRCMD(i, RDAUXA);
+        break;
+      case 1:
+        command = MAKEADDRCMD(i, RDAUXB);
+        break;
+      }
+      spiTxData[0] = command >> 8;
+      spiTxData[1] = command & 0xFF;
+      pec = pec15_calc(2, spiTxData);
+      spiTxData[2] = pec >> 8;
+      spiTxData[3] = pec & 0xFF;
+      HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, spiTxData, spiRxData, 4+8, HAL_MAX_DELAY);
+      HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_SET);
+      // check PEC
+      pec = (0xFF00 & (spiRxData[6] << 8)) | (0xFF & spiRxData[7]);
+      if (pec != pec15_calc(6, spiRxData))
+      {
+        spiErrorCounter[i]++;
+        if (spiErrorCounter[i] >= SPI_ERROR_COUNT_THRESHOLD)
+        {
+          spiError = 1; // Set SPI error
+        }
+        for (uint8_t k = 0; k < 4; k++)
+        {
+          rawTemps[cellBaseNum[i] + k] = 0xFFFF; // Set to invalid value
+        }
+      } else
+      {
+        spiErrorCounter[i] = 0; // Reset error counter
+        // check how many temperatures we should read from this register
+        voltagesPerRegister = (j ==0) ? 3 : 2;
+        for (uint8_t k = 0; k < voltagesPerRegister; k++) // foreach temperature in register
+        {
+          rawTemp = (spiRxData[2 * k + 1] << 8) | spiRxData[2 * k];
+          rawTemps[i * 12 + j * 2 + k] = rawTemp;
+
+          // Check for OTP and UTP
+          if (rawTemp > OTP)
+          {
+            otpCounter[i * 12 + j * 2 + k]++;
+            if (otpCounter[i * 12 + j * 2 + k] >= OTP_COUNT_THRESHOLD)
+            {
+              otpError = 1; // Set OTP error
+            }
+          } else
+          {
+            otpCounter[i * 12 + j * 2 + k] = 0; // Reset counter
+          }
+
+          if (rawTemp < UTP)
+          {
+            utpCounter[i * 12 + j * 2 + k]++;
+            if (utpCounter[i * 12 + j * 2 + k] >= UTP_COUNT_THRESHOLD)
+            {
+              utpError = 1; // Set UTP error
+            }
+          } else
+          {
+            utpCounter[i * 12 + j * 2 + k] = 0; // Reset counter
+          }
+        } // End foreach temperature in register
+      } // End check PEC
+    } // End foreach register
+  } // End foreach slave
+
+}
+
+static void voltageSendCan(void)
+{
+  switch (amsTxMessageCounter)
+  {
+  case 0:
+    can1_ams_s01_voltages_1.s01v01 = can1_ams_s01_voltages_1_s01v01_encode((float)rawVoltages[0] / 10000.0);
+    can1_ams_s01_voltages_1.s01v02 = can1_ams_s01_voltages_1_s01v02_encode((float)rawVoltages[1] / 10000.0);
+    can1_ams_s01_voltages_1.s01v03 = can1_ams_s01_voltages_1_s01v03_encode((float)rawVoltages[2] / 10000.0);
+    can1_ams_s01_voltages_1.s01v04 = can1_ams_s01_voltages_1_s01v04_encode((float)rawVoltages[3] / 10000.0);
+    can1_ams_s01_voltages_1.s01v05 = can1_ams_s01_voltages_1_s01v05_encode((float)rawVoltages[4] / 10000.0);
+    can1_ams_s01_voltages_1.s01v06 = can1_ams_s01_voltages_1_s01v06_encode((float)rawVoltages[5] / 10000.0);
+
+    can1_ams_s01_voltages_1_pack(txData, &can1_ams_s01_voltages_1, CAN1_AMS_S01_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S01_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S01_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 1:
+    can1_ams_s01_voltages_2.s01v07 = can1_ams_s01_voltages_2_s01v07_encode((float) rawVoltages[6] / 10000.0);
+    can1_ams_s01_voltages_2.s01v08 = can1_ams_s01_voltages_2_s01v08_encode((float) rawVoltages[7] / 10000.0);
+    can1_ams_s01_voltages_2.s01v09 = can1_ams_s01_voltages_2_s01v09_encode((float) rawVoltages[8] / 10000.0);
+    can1_ams_s01_voltages_2.s01v10 = can1_ams_s01_voltages_2_s01v10_encode((float) rawVoltages[9] / 10000.0);
+    can1_ams_s01_voltages_2.s01v11 = can1_ams_s01_voltages_2_s01v11_encode((float) rawVoltages[10] / 10000.0);
+
+    can1_ams_s01_voltages_2_pack(txData, &can1_ams_s01_voltages_2, CAN1_AMS_S01_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S01_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S01_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 2:
+    can1_ams_s02_voltages_1.s02v01 = can1_ams_s02_voltages_1_s02v01_encode((float) rawVoltages[11] / 10000.0);
+    can1_ams_s02_voltages_1.s02v02 = can1_ams_s02_voltages_1_s02v02_encode((float) rawVoltages[12] / 10000.0);
+    can1_ams_s02_voltages_1.s02v03 = can1_ams_s02_voltages_1_s02v03_encode((float) rawVoltages[13] / 10000.0);
+    can1_ams_s02_voltages_1.s02v04 = can1_ams_s02_voltages_1_s02v04_encode((float) rawVoltages[14] / 10000.0);
+    can1_ams_s02_voltages_1.s02v05 = can1_ams_s02_voltages_1_s02v05_encode((float) rawVoltages[15] / 10000.0);
+    can1_ams_s02_voltages_1.s02v06 = can1_ams_s02_voltages_1_s02v06_encode((float) rawVoltages[16] / 10000.0);
+
+    can1_ams_s02_voltages_1_pack(txData, &can1_ams_s02_voltages_1, CAN1_AMS_S02_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S02_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S02_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 3:
+    can1_ams_s02_voltages_2.s02v07 = can1_ams_s02_voltages_2_s02v07_encode((float) rawVoltages[17] / 10000.0);
+    can1_ams_s02_voltages_2.s02v08 = can1_ams_s02_voltages_2_s02v08_encode((float) rawVoltages[18] / 10000.0);
+    can1_ams_s02_voltages_2.s02v09 = can1_ams_s02_voltages_2_s02v09_encode((float) rawVoltages[19] / 10000.0);
+    can1_ams_s02_voltages_2.s02v10 = can1_ams_s02_voltages_2_s02v10_encode((float) rawVoltages[20] / 10000.0);
+
+    can1_ams_s02_voltages_2_pack(txData, &can1_ams_s02_voltages_2, CAN1_AMS_S02_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S02_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S02_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 4:
+    can1_ams_s03_voltages_1.s03v01 = can1_ams_s03_voltages_1_s03v01_encode((float) rawVoltages[21] / 10000.0);
+    can1_ams_s03_voltages_1.s03v02 = can1_ams_s03_voltages_1_s03v02_encode((float) rawVoltages[22] / 10000.0);
+    can1_ams_s03_voltages_1.s03v03 = can1_ams_s03_voltages_1_s03v03_encode((float) rawVoltages[23] / 10000.0);
+    can1_ams_s03_voltages_1.s03v04 = can1_ams_s03_voltages_1_s03v04_encode((float) rawVoltages[24] / 10000.0);
+    can1_ams_s03_voltages_1.s03v05 = can1_ams_s03_voltages_1_s03v05_encode((float) rawVoltages[25] / 10000.0);
+    can1_ams_s03_voltages_1.s03v06 = can1_ams_s03_voltages_1_s03v06_encode((float) rawVoltages[26] / 10000.0);
+
+    can1_ams_s03_voltages_1_pack(txData, &can1_ams_s03_voltages_1, CAN1_AMS_S03_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S03_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S03_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 5:
+    can1_ams_s03_voltages_2.s03v07 = can1_ams_s03_voltages_2_s03v07_encode((float) rawVoltages[27] / 10000.0);
+    can1_ams_s03_voltages_2.s03v08 = can1_ams_s03_voltages_2_s03v08_encode((float) rawVoltages[28] / 10000.0);
+    can1_ams_s03_voltages_2.s03v09 = can1_ams_s03_voltages_2_s03v09_encode((float) rawVoltages[29] / 10000.0);
+    can1_ams_s03_voltages_2.s03v10 = can1_ams_s03_voltages_2_s03v10_encode((float) rawVoltages[30] / 10000.0);
+    can1_ams_s03_voltages_2.s03v11 = can1_ams_s03_voltages_2_s03v11_encode((float) rawVoltages[31] / 10000.0);
+
+    can1_ams_s03_voltages_2_pack(txData, &can1_ams_s03_voltages_2, CAN1_AMS_S03_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S03_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S03_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 6:
+    can1_ams_s04_voltages_1.s04v01 = can1_ams_s04_voltages_1_s04v01_encode((float) rawVoltages[32] / 10000.0);
+    can1_ams_s04_voltages_1.s04v02 = can1_ams_s04_voltages_1_s04v02_encode((float) rawVoltages[33] / 10000.0);
+    can1_ams_s04_voltages_1.s04v03 = can1_ams_s04_voltages_1_s04v03_encode((float) rawVoltages[34] / 10000.0);
+    can1_ams_s04_voltages_1.s04v04 = can1_ams_s04_voltages_1_s04v04_encode((float) rawVoltages[35] / 10000.0);
+    can1_ams_s04_voltages_1.s04v05 = can1_ams_s04_voltages_1_s04v05_encode((float) rawVoltages[36] / 10000.0);
+    can1_ams_s04_voltages_1.s04v06 = can1_ams_s04_voltages_1_s04v06_encode((float) rawVoltages[37] / 10000.0);
+
+    can1_ams_s04_voltages_1_pack(txData, &can1_ams_s04_voltages_1, CAN1_AMS_S04_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S04_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S04_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 7:
+    can1_ams_s04_voltages_2.s04v07 = can1_ams_s04_voltages_2_s04v07_encode((float) rawVoltages[38] / 10000.0);
+    can1_ams_s04_voltages_2.s04v08 = can1_ams_s04_voltages_2_s04v08_encode((float) rawVoltages[39] / 10000.0);
+    can1_ams_s04_voltages_2.s04v09 = can1_ams_s04_voltages_2_s04v09_encode((float) rawVoltages[40] / 10000.0);
+    can1_ams_s04_voltages_2.s04v10 = can1_ams_s04_voltages_2_s04v10_encode((float) rawVoltages[41] / 10000.0);
+
+    can1_ams_s04_voltages_2_pack(txData, &can1_ams_s04_voltages_2, CAN1_AMS_S04_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S04_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S04_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 8:
+    can1_ams_s05_voltages_1.s05v01 = can1_ams_s05_voltages_1_s05v01_encode((float) rawVoltages[42] / 10000.0);
+    can1_ams_s05_voltages_1.s05v02 = can1_ams_s05_voltages_1_s05v02_encode((float) rawVoltages[43] / 10000.0);
+    can1_ams_s05_voltages_1.s05v03 = can1_ams_s05_voltages_1_s05v03_encode((float) rawVoltages[44] / 10000.0);
+    can1_ams_s05_voltages_1.s05v04 = can1_ams_s05_voltages_1_s05v04_encode((float) rawVoltages[45] / 10000.0);
+    can1_ams_s05_voltages_1.s05v05 = can1_ams_s05_voltages_1_s05v05_encode((float) rawVoltages[46] / 10000.0);
+    can1_ams_s05_voltages_1.s05v06 = can1_ams_s05_voltages_1_s05v06_encode((float) rawVoltages[47] / 10000.0);
+
+    can1_ams_s05_voltages_1_pack(txData, &can1_ams_s05_voltages_1, CAN1_AMS_S05_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S05_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S05_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 9:
+    can1_ams_s05_voltages_2.s05v07 = can1_ams_s05_voltages_2_s05v07_encode((float) rawVoltages[48] / 10000.0);
+    can1_ams_s05_voltages_2.s05v08 = can1_ams_s05_voltages_2_s05v08_encode((float) rawVoltages[49] / 10000.0);
+    can1_ams_s05_voltages_2.s05v09 = can1_ams_s05_voltages_2_s05v09_encode((float) rawVoltages[50] / 10000.0);
+    can1_ams_s05_voltages_2.s05v10 = can1_ams_s05_voltages_2_s05v10_encode((float) rawVoltages[51] / 10000.0);
+    can1_ams_s05_voltages_2.s05v11 = can1_ams_s05_voltages_2_s05v11_encode((float) rawVoltages[52] / 10000.0);
+
+    can1_ams_s05_voltages_2_pack(txData, &can1_ams_s05_voltages_2, CAN1_AMS_S05_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S05_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S05_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 10:
+    can1_ams_s06_voltages_1.s06v01 = can1_ams_s06_voltages_1_s06v01_encode((float) rawVoltages[53] / 10000.0);
+    can1_ams_s06_voltages_1.s06v02 = can1_ams_s06_voltages_1_s06v02_encode((float) rawVoltages[54] / 10000.0);
+    can1_ams_s06_voltages_1.s06v03 = can1_ams_s06_voltages_1_s06v03_encode((float) rawVoltages[55] / 10000.0);
+    can1_ams_s06_voltages_1.s06v04 = can1_ams_s06_voltages_1_s06v04_encode((float) rawVoltages[56] / 10000.0);
+    can1_ams_s06_voltages_1.s06v05 = can1_ams_s06_voltages_1_s06v05_encode((float) rawVoltages[57] / 10000.0);
+    can1_ams_s06_voltages_1.s06v06 = can1_ams_s06_voltages_1_s06v06_encode((float) rawVoltages[58] / 10000.0);
+
+    can1_ams_s06_voltages_1_pack(txData, &can1_ams_s06_voltages_1, CAN1_AMS_S06_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S06_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S06_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 11:
+    can1_ams_s06_voltages_2.s06v07 = can1_ams_s06_voltages_2_s06v07_encode((float) rawVoltages[59] / 10000.0);
+    can1_ams_s06_voltages_2.s06v08 = can1_ams_s06_voltages_2_s06v08_encode((float) rawVoltages[60] / 10000.0);
+    can1_ams_s06_voltages_2.s06v09 = can1_ams_s06_voltages_2_s06v09_encode((float) rawVoltages[61] / 10000.0);
+    can1_ams_s06_voltages_2.s06v10 = can1_ams_s06_voltages_2_s06v10_encode((float) rawVoltages[62] / 10000.0);
+
+    can1_ams_s06_voltages_2_pack(txData, &can1_ams_s06_voltages_2, CAN1_AMS_S06_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S06_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S06_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 12:
+    can1_ams_s07_voltages_1.s07v01 = can1_ams_s07_voltages_1_s07v01_encode((float) rawVoltages[63] / 10000.0);
+    can1_ams_s07_voltages_1.s07v02 = can1_ams_s07_voltages_1_s07v02_encode((float) rawVoltages[64] / 10000.0);
+    can1_ams_s07_voltages_1.s07v03 = can1_ams_s07_voltages_1_s07v03_encode((float) rawVoltages[65] / 10000.0);
+    can1_ams_s07_voltages_1.s07v04 = can1_ams_s07_voltages_1_s07v04_encode((float) rawVoltages[66] / 10000.0);
+    can1_ams_s07_voltages_1.s07v05 = can1_ams_s07_voltages_1_s07v05_encode((float) rawVoltages[67] / 10000.0);
+    can1_ams_s07_voltages_1.s07v06 = can1_ams_s07_voltages_1_s07v06_encode((float) rawVoltages[68] / 10000.0);
+
+    can1_ams_s07_voltages_1_pack(txData, &can1_ams_s07_voltages_1, CAN1_AMS_S07_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S07_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S07_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 13:
+    can1_ams_s07_voltages_2.s07v07 = can1_ams_s07_voltages_2_s07v07_encode((float) rawVoltages[69] / 10000.0);
+    can1_ams_s07_voltages_2.s07v08 = can1_ams_s07_voltages_2_s07v08_encode((float) rawVoltages[70] / 10000.0);
+    can1_ams_s07_voltages_2.s07v09 = can1_ams_s07_voltages_2_s07v09_encode((float) rawVoltages[71] / 10000.0);
+    can1_ams_s07_voltages_2.s07v10 = can1_ams_s07_voltages_2_s07v10_encode((float) rawVoltages[72] / 10000.0);
+    can1_ams_s07_voltages_2.s07v11 = can1_ams_s07_voltages_2_s07v11_encode((float) rawVoltages[73] / 10000.0);
+
+    can1_ams_s07_voltages_2_pack(txData, &can1_ams_s07_voltages_2, CAN1_AMS_S07_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S07_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S07_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 14:
+    can1_ams_s08_voltages_1.s08v01 = can1_ams_s08_voltages_1_s08v01_encode((float) rawVoltages[74] / 10000.0);
+    can1_ams_s08_voltages_1.s08v02 = can1_ams_s08_voltages_1_s08v02_encode((float) rawVoltages[75] / 10000.0);
+    can1_ams_s08_voltages_1.s08v03 = can1_ams_s08_voltages_1_s08v03_encode((float) rawVoltages[76] / 10000.0);
+    can1_ams_s08_voltages_1.s08v04 = can1_ams_s08_voltages_1_s08v04_encode((float) rawVoltages[77] / 10000.0);
+    can1_ams_s08_voltages_1.s08v05 = can1_ams_s08_voltages_1_s08v05_encode((float) rawVoltages[78] / 10000.0);
+    can1_ams_s08_voltages_1.s08v06 = can1_ams_s08_voltages_1_s08v06_encode((float) rawVoltages[79] / 10000.0);
+
+    can1_ams_s08_voltages_1_pack(txData, &can1_ams_s08_voltages_1, CAN1_AMS_S08_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S08_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S08_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 15:
+    can1_ams_s08_voltages_2.s08v07 = can1_ams_s08_voltages_2_s08v07_encode((float) rawVoltages[80] / 10000.0);
+    can1_ams_s08_voltages_2.s08v08 = can1_ams_s08_voltages_2_s08v08_encode((float) rawVoltages[81] / 10000.0);
+    can1_ams_s08_voltages_2.s08v09 = can1_ams_s08_voltages_2_s08v09_encode((float) rawVoltages[82] / 10000.0);
+    can1_ams_s08_voltages_2.s08v10 = can1_ams_s08_voltages_2_s08v10_encode((float) rawVoltages[83] / 10000.0);
+
+    can1_ams_s08_voltages_2_pack(txData, &can1_ams_s08_voltages_2, CAN1_AMS_S08_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S08_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S08_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 16:
+    can1_ams_s09_voltages_1.s09v01 = can1_ams_s09_voltages_1_s09v01_encode((float) rawVoltages[84] / 10000.0);
+    can1_ams_s09_voltages_1.s09v02 = can1_ams_s09_voltages_1_s09v02_encode((float) rawVoltages[85] / 10000.0);
+    can1_ams_s09_voltages_1.s09v03 = can1_ams_s09_voltages_1_s09v03_encode((float) rawVoltages[86] / 10000.0);
+    can1_ams_s09_voltages_1.s09v04 = can1_ams_s09_voltages_1_s09v04_encode((float) rawVoltages[87] / 10000.0);
+    can1_ams_s09_voltages_1.s09v05 = can1_ams_s09_voltages_1_s09v05_encode((float) rawVoltages[88] / 10000.0);
+    can1_ams_s09_voltages_1.s09v06 = can1_ams_s09_voltages_1_s09v06_encode((float) rawVoltages[89] / 10000.0);
+
+    can1_ams_s09_voltages_1_pack(txData, &can1_ams_s09_voltages_1, CAN1_AMS_S09_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S09_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S09_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 17:
+    can1_ams_s09_voltages_2.s09v07 = can1_ams_s09_voltages_2_s09v07_encode((float) rawVoltages[90] / 10000.0);
+    can1_ams_s09_voltages_2.s09v08 = can1_ams_s09_voltages_2_s09v08_encode((float) rawVoltages[91] / 10000.0);
+    can1_ams_s09_voltages_2.s09v09 = can1_ams_s09_voltages_2_s09v09_encode((float) rawVoltages[92] / 10000.0);
+    can1_ams_s09_voltages_2.s09v10 = can1_ams_s09_voltages_2_s09v10_encode((float) rawVoltages[93] / 10000.0);
+    can1_ams_s09_voltages_2.s09v11 = can1_ams_s09_voltages_2_s09v11_encode((float) rawVoltages[94] / 10000.0);
+
+    can1_ams_s09_voltages_2_pack(txData, &can1_ams_s09_voltages_2, CAN1_AMS_S09_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S09_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S09_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 18:
+    can1_ams_s10_voltages_1.s10v01 = can1_ams_s10_voltages_1_s10v01_encode((float) rawVoltages[95] / 10000.0);
+    can1_ams_s10_voltages_1.s10v02 = can1_ams_s10_voltages_1_s10v02_encode((float) rawVoltages[96] / 10000.0);
+    can1_ams_s10_voltages_1.s10v03 = can1_ams_s10_voltages_1_s10v03_encode((float) rawVoltages[97] / 10000.0);
+    can1_ams_s10_voltages_1.s10v04 = can1_ams_s10_voltages_1_s10v04_encode((float) rawVoltages[98] / 10000.0);
+    can1_ams_s10_voltages_1.s10v05 = can1_ams_s10_voltages_1_s10v05_encode((float) rawVoltages[99] / 10000.0);
+    can1_ams_s10_voltages_1.s10v06 = can1_ams_s10_voltages_1_s10v06_encode((float) rawVoltages[100] / 10000.0);
+
+    can1_ams_s10_voltages_1_pack(txData, &can1_ams_s10_voltages_1, CAN1_AMS_S10_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S10_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S10_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 19:
+    can1_ams_s10_voltages_2.s10v07 = can1_ams_s10_voltages_2_s10v07_encode((float) rawVoltages[101] / 10000.0);
+    can1_ams_s10_voltages_2.s10v08 = can1_ams_s10_voltages_2_s10v08_encode((float) rawVoltages[102] / 10000.0);
+    can1_ams_s10_voltages_2.s10v09 = can1_ams_s10_voltages_2_s10v09_encode((float) rawVoltages[103] / 10000.0);
+    can1_ams_s10_voltages_2.s10v10 = can1_ams_s10_voltages_2_s10v10_encode((float) rawVoltages[104] / 10000.0);
+
+    can1_ams_s10_voltages_2_pack(txData, &can1_ams_s10_voltages_2, CAN1_AMS_S10_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S10_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S10_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 20:
+    can1_ams_s11_voltages_1.s11v01 = can1_ams_s11_voltages_1_s11v01_encode((float) rawVoltages[105] / 10000.0);
+    can1_ams_s11_voltages_1.s11v02 = can1_ams_s11_voltages_1_s11v02_encode((float) rawVoltages[106] / 10000.0);
+    can1_ams_s11_voltages_1.s11v03 = can1_ams_s11_voltages_1_s11v03_encode((float) rawVoltages[107] / 10000.0);
+    can1_ams_s11_voltages_1.s11v04 = can1_ams_s11_voltages_1_s11v04_encode((float) rawVoltages[108] / 10000.0);
+    can1_ams_s11_voltages_1.s11v05 = can1_ams_s11_voltages_1_s11v05_encode((float) rawVoltages[109] / 10000.0);
+    can1_ams_s11_voltages_1.s11v06 = can1_ams_s11_voltages_1_s11v06_encode((float) rawVoltages[110] / 10000.0);
+
+    can1_ams_s11_voltages_1_pack(txData, &can1_ams_s11_voltages_1, CAN1_AMS_S11_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S11_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S11_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 21:
+    can1_ams_s11_voltages_2.s11v07 = can1_ams_s11_voltages_2_s11v07_encode((float) rawVoltages[111] / 10000.0);
+    can1_ams_s11_voltages_2.s11v08 = can1_ams_s11_voltages_2_s11v08_encode((float) rawVoltages[112] / 10000.0);
+    can1_ams_s11_voltages_2.s11v09 = can1_ams_s11_voltages_2_s11v09_encode((float) rawVoltages[113] / 10000.0);
+    can1_ams_s11_voltages_2.s11v10 = can1_ams_s11_voltages_2_s11v10_encode((float) rawVoltages[114] / 10000.0);
+    can1_ams_s11_voltages_2.s11v11 = can1_ams_s11_voltages_2_s11v11_encode((float) rawVoltages[115] / 10000.0);
+
+    can1_ams_s11_voltages_2_pack(txData, &can1_ams_s11_voltages_2, CAN1_AMS_S11_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S11_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S11_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 22:
+    can1_ams_s12_voltages_1.s12v01 = can1_ams_s12_voltages_1_s12v01_encode((float) rawVoltages[116] / 10000.0);
+    can1_ams_s12_voltages_1.s12v02 = can1_ams_s12_voltages_1_s12v02_encode((float) rawVoltages[117] / 10000.0);
+    can1_ams_s12_voltages_1.s12v03 = can1_ams_s12_voltages_1_s12v03_encode((float) rawVoltages[118] / 10000.0);
+    can1_ams_s12_voltages_1.s12v04 = can1_ams_s12_voltages_1_s12v04_encode((float) rawVoltages[119] / 10000.0);
+    can1_ams_s12_voltages_1.s12v05 = can1_ams_s12_voltages_1_s12v05_encode((float) rawVoltages[120] / 10000.0);
+    can1_ams_s12_voltages_1.s12v06 = can1_ams_s12_voltages_1_s12v06_encode((float) rawVoltages[121] / 10000.0);
+
+    can1_ams_s12_voltages_1_pack(txData, &can1_ams_s12_voltages_1, CAN1_AMS_S12_VOLTAGES_1_LENGTH);
+    txHeader.StdId = CAN1_AMS_S12_VOLTAGES_1_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S12_VOLTAGES_1_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 23:
+    can1_ams_s12_voltages_2.s12v07 = can1_ams_s12_voltages_2_s12v07_encode((float) rawVoltages[122] / 10000.0);
+    can1_ams_s12_voltages_2.s12v08 = can1_ams_s12_voltages_2_s12v08_encode((float) rawVoltages[123] / 10000.0);
+    can1_ams_s12_voltages_2.s12v09 = can1_ams_s12_voltages_2_s12v09_encode((float) rawVoltages[124] / 10000.0);
+    can1_ams_s12_voltages_2.s12v10 = can1_ams_s12_voltages_2_s12v10_encode((float) rawVoltages[125] / 10000.0);
+
+    can1_ams_s12_voltages_2_pack(txData, &can1_ams_s12_voltages_2, CAN1_AMS_S12_VOLTAGES_2_LENGTH);
+    txHeader.StdId = CAN1_AMS_S12_VOLTAGES_2_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S12_VOLTAGES_2_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+  }
+}
+
+static void temperatureSendCan(void)
+{
+  switch (amsTxMessageCounter % 12)
+  {
+  case 0:
+    can1_ams_cell_temperatures.temperature_multiplexor = 0;
+    can1_ams_cell_temperatures.t1s1 = can1_ams_cell_temperatures_t1s1_encode(
+        thermistor_adc_to_c_float(rawTemps[0]));
+    can1_ams_cell_temperatures.t2s1 = can1_ams_cell_temperatures_t1s2_encode(
+        thermistor_adc_to_c_float(rawTemps[1]));
+    can1_ams_cell_temperatures.t3s1 = can1_ams_cell_temperatures_t1s3_encode(
+        thermistor_adc_to_c_float(rawTemps[2]));
+    can1_ams_cell_temperatures.t4s1 = can1_ams_cell_temperatures_t1s4_encode(
+        thermistor_adc_to_c_float(rawTemps[3]));
+    can1_ams_cell_temperatures.t5s1 = can1_ams_cell_temperatures_t1s5_encode(
+        thermistor_adc_to_c_float(rawTemps[4]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 1:
+    can1_ams_cell_temperatures.temperature_multiplexor = 1;
+    can1_ams_cell_temperatures.t1s2 = can1_ams_cell_temperatures_t1s2_encode(thermistor_adc_to_c_float(rawTemps[5]));
+    can1_ams_cell_temperatures.t2s2 = can1_ams_cell_temperatures_t2s2_encode(thermistor_adc_to_c_float(rawTemps[6]));
+    can1_ams_cell_temperatures.t3s2 = can1_ams_cell_temperatures_t3s2_encode(thermistor_adc_to_c_float(rawTemps[7]));
+    can1_ams_cell_temperatures.t4s2 = can1_ams_cell_temperatures_t4s2_encode(thermistor_adc_to_c_float(rawTemps[8]));
+    can1_ams_cell_temperatures.t5s2 = can1_ams_cell_temperatures_t5s2_encode(thermistor_adc_to_c_float(rawTemps[9]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 2:
+    can1_ams_cell_temperatures.temperature_multiplexor = 2;
+    can1_ams_cell_temperatures.t1s3 = can1_ams_cell_temperatures_t1s3_encode(
+        thermistor_adc_to_c_float(rawTemps[10]));
+    can1_ams_cell_temperatures.t2s3 = can1_ams_cell_temperatures_t2s3_encode(
+        thermistor_adc_to_c_float(rawTemps[11]));
+    can1_ams_cell_temperatures.t3s3 = can1_ams_cell_temperatures_t3s3_encode(
+        thermistor_adc_to_c_float(rawTemps[12]));
+    can1_ams_cell_temperatures.t4s3 = can1_ams_cell_temperatures_t4s3_encode(
+        thermistor_adc_to_c_float(rawTemps[13]));
+    can1_ams_cell_temperatures.t5s3 = can1_ams_cell_temperatures_t5s3_encode(
+        thermistor_adc_to_c_float(rawTemps[14]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 3:
+    can1_ams_cell_temperatures.temperature_multiplexor = 3;
+    can1_ams_cell_temperatures.t1s4 = can1_ams_cell_temperatures_t1s4_encode(
+        thermistor_adc_to_c_float(rawTemps[15]));
+    can1_ams_cell_temperatures.t2s4 = can1_ams_cell_temperatures_t2s4_encode(
+        thermistor_adc_to_c_float(rawTemps[16]));
+    can1_ams_cell_temperatures.t3s4 = can1_ams_cell_temperatures_t3s4_encode(
+        thermistor_adc_to_c_float(rawTemps[17]));
+    can1_ams_cell_temperatures.t4s4 = can1_ams_cell_temperatures_t4s4_encode(
+        thermistor_adc_to_c_float(rawTemps[18]));
+    can1_ams_cell_temperatures.t5s4 = can1_ams_cell_temperatures_t5s4_encode(
+        thermistor_adc_to_c_float(rawTemps[19]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 4:
+    can1_ams_cell_temperatures.temperature_multiplexor = 4;
+    can1_ams_cell_temperatures.t1s5 = can1_ams_cell_temperatures_t1s5_encode(
+        thermistor_adc_to_c_float(rawTemps[20]));
+    can1_ams_cell_temperatures.t2s5 = can1_ams_cell_temperatures_t2s5_encode(
+        thermistor_adc_to_c_float(rawTemps[21]));
+    can1_ams_cell_temperatures.t3s5 = can1_ams_cell_temperatures_t3s5_encode(
+        thermistor_adc_to_c_float(rawTemps[22]));
+    can1_ams_cell_temperatures.t4s5 = can1_ams_cell_temperatures_t4s5_encode(
+        thermistor_adc_to_c_float(rawTemps[23]));
+    can1_ams_cell_temperatures.t5s5 = can1_ams_cell_temperatures_t5s5_encode(
+        thermistor_adc_to_c_float(rawTemps[24]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 5:
+    can1_ams_cell_temperatures.temperature_multiplexor = 5;
+    can1_ams_cell_temperatures.t1s6 = can1_ams_cell_temperatures_t1s6_encode(
+        thermistor_adc_to_c_float(rawTemps[25]));
+    can1_ams_cell_temperatures.t2s6 = can1_ams_cell_temperatures_t2s6_encode(
+        thermistor_adc_to_c_float(rawTemps[26]));
+    can1_ams_cell_temperatures.t3s6 = can1_ams_cell_temperatures_t3s6_encode(
+        thermistor_adc_to_c_float(rawTemps[27]));
+    can1_ams_cell_temperatures.t4s6 = can1_ams_cell_temperatures_t4s6_encode(
+        thermistor_adc_to_c_float(rawTemps[28]));
+    can1_ams_cell_temperatures.t5s6 = can1_ams_cell_temperatures_t5s6_encode(
+        thermistor_adc_to_c_float(rawTemps[29]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 6:
+    can1_ams_cell_temperatures.temperature_multiplexor = 6;
+    can1_ams_cell_temperatures.t1s7 = can1_ams_cell_temperatures_t1s7_encode(
+        thermistor_adc_to_c_float(rawTemps[30]));
+    can1_ams_cell_temperatures.t2s7 = can1_ams_cell_temperatures_t2s7_encode(
+        thermistor_adc_to_c_float(rawTemps[31]));
+    can1_ams_cell_temperatures.t3s7 = can1_ams_cell_temperatures_t3s7_encode(
+        thermistor_adc_to_c_float(rawTemps[32]));
+    can1_ams_cell_temperatures.t4s7 = can1_ams_cell_temperatures_t4s7_encode(
+        thermistor_adc_to_c_float(rawTemps[33]));
+    can1_ams_cell_temperatures.t5s7 = can1_ams_cell_temperatures_t5s7_encode(
+        thermistor_adc_to_c_float(rawTemps[34]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 7:
+    can1_ams_cell_temperatures.temperature_multiplexor = 7;
+    can1_ams_cell_temperatures.t1s8 = can1_ams_cell_temperatures_t1s8_encode(
+        thermistor_adc_to_c_float(rawTemps[35]));
+    can1_ams_cell_temperatures.t2s8 = can1_ams_cell_temperatures_t2s8_encode(
+        thermistor_adc_to_c_float(rawTemps[36]));
+    can1_ams_cell_temperatures.t3s8 = can1_ams_cell_temperatures_t3s8_encode(
+        thermistor_adc_to_c_float(rawTemps[37]));
+    can1_ams_cell_temperatures.t4s8 = can1_ams_cell_temperatures_t4s8_encode(
+        thermistor_adc_to_c_float(rawTemps[38]));
+    can1_ams_cell_temperatures.t5s8 = can1_ams_cell_temperatures_t5s8_encode(
+        thermistor_adc_to_c_float(rawTemps[39]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 8:
+    can1_ams_cell_temperatures.temperature_multiplexor = 8;
+    can1_ams_cell_temperatures.t1s9 = can1_ams_cell_temperatures_t1s9_encode(
+        thermistor_adc_to_c_float(rawTemps[40]));
+    can1_ams_cell_temperatures.t2s9 = can1_ams_cell_temperatures_t2s9_encode(
+        thermistor_adc_to_c_float(rawTemps[41]));
+    can1_ams_cell_temperatures.t3s9 = can1_ams_cell_temperatures_t3s9_encode(
+        thermistor_adc_to_c_float(rawTemps[42]));
+    can1_ams_cell_temperatures.t4s9 = can1_ams_cell_temperatures_t4s9_encode(
+        thermistor_adc_to_c_float(rawTemps[43]));
+    can1_ams_cell_temperatures.t5s9 = can1_ams_cell_temperatures_t5s9_encode(
+        thermistor_adc_to_c_float(rawTemps[44]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 9:
+    can1_ams_cell_temperatures.temperature_multiplexor = 9;
+    can1_ams_cell_temperatures.t1s10 = can1_ams_cell_temperatures_t1s10_encode(
+        thermistor_adc_to_c_float(rawTemps[45]));
+    can1_ams_cell_temperatures.t2s10 = can1_ams_cell_temperatures_t2s10_encode(
+        thermistor_adc_to_c_float(rawTemps[46]));
+    can1_ams_cell_temperatures.t3s10 = can1_ams_cell_temperatures_t3s10_encode(
+        thermistor_adc_to_c_float(rawTemps[47]));
+    can1_ams_cell_temperatures.t4s10 = can1_ams_cell_temperatures_t4s10_encode(
+        thermistor_adc_to_c_float(rawTemps[48]));
+    can1_ams_cell_temperatures.t5s10 = can1_ams_cell_temperatures_t5s10_encode(
+        thermistor_adc_to_c_float(rawTemps[49]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 10:
+    can1_ams_cell_temperatures.temperature_multiplexor = 10;
+    can1_ams_cell_temperatures.t1s11 = can1_ams_cell_temperatures_t1s11_encode(
+        thermistor_adc_to_c_float(rawTemps[50]));
+    can1_ams_cell_temperatures.t2s11 = can1_ams_cell_temperatures_t2s11_encode(
+        thermistor_adc_to_c_float(rawTemps[51]));
+    can1_ams_cell_temperatures.t3s11 = can1_ams_cell_temperatures_t3s11_encode(
+        thermistor_adc_to_c_float(rawTemps[52]));
+    can1_ams_cell_temperatures.t4s11 = can1_ams_cell_temperatures_t4s11_encode(
+        thermistor_adc_to_c_float(rawTemps[53]));
+    can1_ams_cell_temperatures.t5s11 = can1_ams_cell_temperatures_t5s11_encode(
+        thermistor_adc_to_c_float(rawTemps[54]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+
+  case 11:
+    can1_ams_cell_temperatures.temperature_multiplexor = 11;
+    can1_ams_cell_temperatures.t1s12 = can1_ams_cell_temperatures_t1s12_encode(
+        thermistor_adc_to_c_float(rawTemps[55]));
+    can1_ams_cell_temperatures.t2s12 = can1_ams_cell_temperatures_t2s12_encode(
+        thermistor_adc_to_c_float(rawTemps[56]));
+    can1_ams_cell_temperatures.t3s12 = can1_ams_cell_temperatures_t3s12_encode(
+        thermistor_adc_to_c_float(rawTemps[57]));
+    can1_ams_cell_temperatures.t4s12 = can1_ams_cell_temperatures_t4s12_encode(
+        thermistor_adc_to_c_float(rawTemps[58]));
+    can1_ams_cell_temperatures.t5s12 = can1_ams_cell_temperatures_t5s12_encode(
+        thermistor_adc_to_c_float(rawTemps[59]));
+
+    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.RTR = CAN_RTR_DATA;
+    if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+      Error_Handler();
+    break;
+  }
+}
+
+static void readCanMessages(void)
+{
+  while (HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0)
+  {
+    if (HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &rxHeader, rxData) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    // Process the received message based on its ID
+    switch (rxHeader.StdId)
+    {
+    case CAN1_DBU_STATUS_1_FRAME_ID:
+      can1_dbu_status_1_unpack(&can1_dbu_status_1, rxData, CAN1_DBU_STATUS_1_LENGTH);
+      break;
+    case CAN1_ECU_STATUS_FRAME_ID:
+      can1_ecu_status_unpack(&can1_ecu_status, rxData, CAN1_ECU_STATUS_LENGTH);
+      break;
+    case CAN1_AMS_PARAMETERS_SET_FRAME_ID:
+      can1_ams_parameters_set_unpack(&can1_ams_parameters_set, rxData, CAN1_AMS_PARAMETERS_SET_LENGTH);
+      break;
+    default:
+      // Unknown ID, handle if necessary
+      break;
+    }
+  }
+
+  // Read CAN2
+  while (HAL_CAN_GetRxFifoFillLevel(&hcan2, CAN_RX_FIFO0) > 0)
+  {
+    if (HAL_CAN_GetRxMessage(&hcan2, CAN_RX_FIFO0, &rxHeader, rxData) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    // Process the received message based on its ID
+    switch (rxHeader.StdId)
+    {
+    case CAN2_IVT_MSG_RESULT_U2_FRAME_ID:
+      can2_ivt_msg_result_u2_unpack(&can2_ivt_msg_result_u2, rxData, CAN2_IVT_MSG_RESULT_U2_LENGTH);
+      break;
+    case CAN2_IVT_MSG_RESULT_U1_FRAME_ID:
+      can2_ivt_msg_result_u1_unpack(&can2_ivt_msg_result_u1, rxData, CAN2_IVT_MSG_RESULT_U1_LENGTH);
+      break;
+    case CAN2_IVT_MSG_RESULT_T_FRAME_ID:
+      can2_ivt_msg_result_t_unpack(&can2_ivt_msg_result_t, rxData, CAN2_IVT_MSG_RESULT_T_LENGTH);
+      break;
+    case CAN2_IVT_MSG_RESULT_W_FRAME_ID:
+      can2_ivt_msg_result_w_unpack(&can2_ivt_msg_result_w, rxData, CAN2_IVT_MSG_RESULT_W_LENGTH);
+      break;
+    case CAN2_IVT_MSG_RESULT_WH_FRAME_ID:
+      can2_ivt_msg_result_wh_unpack(&can2_ivt_msg_result_wh, rxData, CAN2_IVT_MSG_RESULT_WH_LENGTH);
+      break;
+    case CAN2_IVT_MSG_RESULT_I_FRAME_ID:
+      can2_ivt_msg_result_i_unpack(&can2_ivt_msg_result_i, rxData, CAN2_IVT_MSG_RESULT_I_LENGTH);
+      break;
+    case CAN2_IVT_MSG_RESULT_U3_FRAME_ID:
+      can2_ivt_msg_result_u3_unpack(&can2_ivt_msg_result_u3, rxData, CAN2_IVT_MSG_RESULT_U3_LENGTH);
+      break;
+    case CAN2_IVT_MSG_RESULT_AS_FRAME_ID:
+      can2_ivt_msg_result_as_unpack(&can2_ivt_msg_result_as, rxData, CAN2_IVT_MSG_RESULT_AS_LENGTH);
+      break;
+    default:
+      // Unknown ID, handle if necessary
+      break;
+    }
+  }
+}
+
+static void sendStatus(void)
+{
+  uint16_t maxVoltage = 0;
+  uint16_t minVoltage = 0xFFFF;
+  uint16_t maxTemperature = 0;
+  uint16_t minTemperature = 0xFFFF;
+  for (int i = 0; i < 126; i++)
+  {
+    if (rawVoltages[i] > maxVoltage)
+      maxVoltage = rawVoltages[i];
+    if (rawVoltages[i] < minVoltage)
+      minVoltage = rawVoltages[i];
+  }
+  for (int i = 0; i < 12; i++)
+  {
+    if (rawTemps[i] > maxTemperature)
+      maxTemperature = rawTemps[i];
+    if (rawTemps[i] < minTemperature)
+      minTemperature = rawTemps[i];
+  }
+  can1_ams_status_1.max_cell_voltage = can1_ams_status_1_max_cell_voltage_encode((float) maxVoltage / 10000.0);
+  can1_ams_status_1.min_cell_voltage = can1_ams_status_1_min_cell_voltage_encode((float) minVoltage / 10000.0);
+  can1_ams_status_1.max_cell_temperature = can1_ams_status_1_max_cell_temperature_encode(
+      thermistor_adc_to_c_float(maxTemperature));
+  can1_ams_status_1.min_cell_temperature = can1_ams_status_1_min_cell_temperature_encode(
+      thermistor_adc_to_c_float(minTemperature));
+  can1_ams_status_1.fsm_state = fsmState;
+  can1_ams_status_1.ticks = can1_ams_status_1_ticks_encode(deltaTick);
+  can1_ams_status_1_pack(txData, &can1_ams_status_1, CAN1_AMS_STATUS_1_LENGTH);
+  txHeader.StdId = CAN1_AMS_STATUS_1_FRAME_ID;
+  txHeader.DLC = CAN1_AMS_STATUS_1_LENGTH;
+  txHeader.IDE = CAN_ID_STD;
+  txHeader.RTR = CAN_RTR_DATA;
+  if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+    Error_Handler();
+}
+
+static void stepStateMachine(void)
+{
+  switch (fsmState)
+  {
+  case STATE_IDLE:
+    HAL_GPIO_WritePin(AIR_N_ENABLE_GPIO_Port, AIR_N_ENABLE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(AIR_P_ENABLE_GPIO_Port, AIR_P_ENABLE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(PRECHARGE_ENABLE_GPIO_Port, PRECHARGE_ENABLE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MCU_AMS_ERROR_N_GPIO_Port, MCU_AMS_ERROR_N_Pin, GPIO_PIN_SET);
+    if (ovpError || uvpError || otpError || utpError || spiError)
+    {
+      fsmState = STATE_ERROR;
+    }
+    else if (   (HAL_GPIO_ReadPin(SC_PROBE_GPIO_Port, SC_PROBE_Pin) == GPIO_PIN_SET)
+             && can1_dbu_status_1.activate_ts_button)
+    {
+      fsmState = STATE_PRECHARGE1;
+    }
+    break;
+
+  case STATE_PRECHARGE1:
+    HAL_GPIO_WritePin(AIR_N_ENABLE_GPIO_Port, AIR_N_ENABLE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(AIR_P_ENABLE_GPIO_Port, AIR_P_ENABLE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(PRECHARGE_ENABLE_GPIO_Port, PRECHARGE_ENABLE_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(MCU_AMS_ERROR_N_GPIO_Port, MCU_AMS_ERROR_N_Pin, GPIO_PIN_SET);
+    if (ovpError || uvpError || otpError || utpError || spiError)
+    {
+      fsmState = STATE_ERROR;
+    }
+    else if (HAL_GPIO_ReadPin(PRECHARGE_CLOSED_SIGNAL_GPIO_Port, PRECHARGE_CLOSED_SIGNAL_Pin) == GPIO_PIN_SET)
+    {
+      fsmState = STATE_PRECHARGE2;
+      prechargeStartTime = HAL_GetTick();
+    }
+    break;
+
+  case STATE_PRECHARGE2:
+    HAL_GPIO_WritePin(AIR_N_ENABLE_GPIO_Port, AIR_N_ENABLE_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(AIR_P_ENABLE_GPIO_Port, AIR_P_ENABLE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(PRECHARGE_ENABLE_GPIO_Port, PRECHARGE_ENABLE_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(MCU_AMS_ERROR_N_GPIO_Port, MCU_AMS_ERROR_N_Pin, GPIO_PIN_SET);
+    prechargeTimer = HAL_GetTick() - prechargeStartTime;
+    if (ovpError || uvpError || otpError || utpError || spiError)
+    {
+      fsmState = STATE_ERROR;
+    }
+    else if (   (HAL_GPIO_ReadPin(PRECHARGE_CLOSED_SIGNAL_GPIO_Port, PRECHARGE_CLOSED_SIGNAL_Pin) == GPIO_PIN_SET)
+             && (HAL_GPIO_ReadPin(AIR_N_CLOSED_GPIO_Port, AIR_N_CLOSED_Pin) == GPIO_PIN_SET)
+             && (can2_ivt_msg_result_u1_ivt_result_u1_decode(can2_ivt_msg_result_u1.ivt_result_u1) >
+                 0.95 * can2_ivt_msg_result_u2_ivt_result_u2_decode(can2_ivt_msg_result_u2.ivt_result_u2))
+             && (prechargeTimer > MIN_PRECHARGE_TIME))
+    {
+      fsmState = STATE_TS_ON;
+    }
+    else if (prechargeTimer > PRECHARGE_TIMEOUT)
+    {
+      fsmState = STATE_IDLE;
+    }
+    break;
+
+  case STATE_TS_ON:
+    HAL_GPIO_WritePin(AIR_N_ENABLE_GPIO_Port, AIR_N_ENABLE_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(AIR_P_ENABLE_GPIO_Port, AIR_P_ENABLE_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(PRECHARGE_ENABLE_GPIO_Port, PRECHARGE_ENABLE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MCU_AMS_ERROR_N_GPIO_Port, MCU_AMS_ERROR_N_Pin, GPIO_PIN_SET);
+    if (ovpError || uvpError || otpError || utpError || spiError)
+    {
+      fsmState = STATE_ERROR;
+    }
+    else if (HAL_GPIO_ReadPin(SC_PROBE_GPIO_Port, SC_PROBE_Pin) == GPIO_PIN_RESET)
+    {
+      fsmState = STATE_IDLE;
+    }
+    break;
+
+  case STATE_ERROR:
+    HAL_GPIO_WritePin(AIR_N_ENABLE_GPIO_Port, AIR_N_ENABLE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(AIR_P_ENABLE_GPIO_Port, AIR_P_ENABLE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(PRECHARGE_ENABLE_GPIO_Port, PRECHARGE_ENABLE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MCU_AMS_ERROR_N_GPIO_Port, MCU_AMS_ERROR_N_Pin, GPIO_PIN_RESET);
+    break;
+  }
+}
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
@@ -1063,12 +1920,12 @@ void Error_Handler(void)
 }
 #ifdef USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */

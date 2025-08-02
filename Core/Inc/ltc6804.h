@@ -142,6 +142,7 @@
 /* PEC error detection — pre-computed CRC15 Table */
 extern const uint16_t crc15Table[256];
 
+uint16_t pec15_calc(uint8_t len, uint8_t *data);
 #endif /* INC_LTC6804_H_ */
 
 
