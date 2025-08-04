@@ -222,6 +222,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
   configCan1Filters();
   configCan2Filters();
+  HAL_CAN_Start(&hcan1);
+  HAL_CAN_Start(&hcan2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
