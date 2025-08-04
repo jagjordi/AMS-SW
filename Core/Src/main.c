@@ -56,6 +56,8 @@ typedef enum
 
 #define PRECHARGE_TIMEOUT 10000 // Timeout for precharge in milliseconds
 #define MIN_PRECHARGE_TIME 5000
+
+#define CYCLE_TIME 50 // Main loop cycle time in milliseconds
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -126,6 +128,7 @@ struct can2_ivt_msg_result_i_t can2_ivt_msg_result_i;
 struct can2_ivt_msg_result_u3_t can2_ivt_msg_result_u3;
 struct can2_ivt_msg_result_as_t can2_ivt_msg_result_as;
 
+// voltage readings and conversions
 uint16_t rawVoltages[126];
 uint16_t rawTemps[60];
 
@@ -276,7 +279,7 @@ int main(void)
     while (HAL_GetTick() - tick < CYCLE_TIME);
 
     HAL_GPIO_TogglePin(WATCHDOG_INPUT_GPIO_Port, WATCHDOG_INPUT_Pin); // Toggle watchdog pin
-    if (!amssTxMessageCounter) HAL_GPIO_TogglePin(MCU_STATUS_LED3_GPIO_Port, MCU_STATUS_LED3_Pin);
+    if (!amsTxMessageCounter) HAL_GPIO_TogglePin(MCU_STATUS_LED3_GPIO_Port, MCU_STATUS_LED3_Pin);
 
   }
   /* USER CODE END 3 */
