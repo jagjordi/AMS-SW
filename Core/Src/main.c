@@ -48,16 +48,18 @@ typedef enum
 #define OTP 6768 // 60 degrees
 #define UTP 24796 // -10 degrees
 
-#define OVP_COUNT_THRESHOLD 10 // Number of consecutive OVP events to trigger protection
-#define UVP_COUNT_THRESHOLD 10 // Number of consecutive UVP events to trigger protection
-#define OTP_COUNT_THRESHOLD 10 // Number of consecutive OTP events to trigger protection
-#define UTP_COUNT_THRESHOLD 10 // Number of consecutive UTP events to trigger protection
-#define SPI_ERROR_COUNT_THRESHOLD 5 // Number of consecutive SPI errors to trigger protection
+#define CYCLE_TIME 50 // Main loop cycle time in milliseconds
+
+#define OVP_COUNT_THRESHOLD 500/CYCLE_TIME // Number of consecutive OVP events to trigger protection
+#define UVP_COUNT_THRESHOLD 500/CYCLE_TIME // Number of consecutive UVP events to trigger protection
+#define OTP_COUNT_THRESHOLD 1000/CYCLE_TIME // Number of consecutive OTP events to trigger protection
+#define UTP_COUNT_THRESHOLD 1000/CYCLE_TIME // Number of consecutive UTP events to trigger protection
+
+#define SPI_ERROR_COUNT_THRESHOLD 500/CYCLE_TIME // Number of consecutive SPI errors to trigger protection
 
 #define PRECHARGE_TIMEOUT 10000 // Timeout for precharge in milliseconds
 #define MIN_PRECHARGE_TIME 5000
 
-#define CYCLE_TIME 50 // Main loop cycle time in milliseconds
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -88,6 +90,7 @@ uint8_t rxData[8];
 
 // TX structs
 struct can1_ams_status_1_t can1_ams_status_1;
+struct can1_ams_status_2_t can1_ams_status_2;
 struct can1_ams_s01_voltages_1_t can1_ams_s01_voltages_1;
 struct can1_ams_s01_voltages_2_t can1_ams_s01_voltages_2;
 struct can1_ams_s02_voltages_1_t can1_ams_s02_voltages_1;
@@ -112,8 +115,18 @@ struct can1_ams_s11_voltages_1_t can1_ams_s11_voltages_1;
 struct can1_ams_s11_voltages_2_t can1_ams_s11_voltages_2;
 struct can1_ams_s12_voltages_1_t can1_ams_s12_voltages_1;
 struct can1_ams_s12_voltages_2_t can1_ams_s12_voltages_2;
-struct can1_ams_cell_temperatures_t can1_ams_cell_temperatures;
-
+struct can1_ams_s01_temperatures_t can1_ams_s01_temperatures;
+struct can1_ams_s02_temperatures_t can1_ams_s02_temperatures;
+struct can1_ams_s03_temperatures_t can1_ams_s03_temperatures;
+struct can1_ams_s04_temperatures_t can1_ams_s04_temperatures;
+struct can1_ams_s05_temperatures_t can1_ams_s05_temperatures;
+struct can1_ams_s06_temperatures_t can1_ams_s06_temperatures;
+struct can1_ams_s07_temperatures_t can1_ams_s07_temperatures;
+struct can1_ams_s08_temperatures_t can1_ams_s08_temperatures;
+struct can1_ams_s09_temperatures_t can1_ams_s09_temperatures;
+struct can1_ams_s10_temperatures_t can1_ams_s10_temperatures;
+struct can1_ams_s11_temperatures_t can1_ams_s11_temperatures;
+struct can1_ams_s12_temperatures_t can1_ams_s12_temperatures;
 
 // RX structs
 struct can1_dbu_status_1_t can1_dbu_status_1;
@@ -136,7 +149,7 @@ uint8_t  ovpCounter[126], ovpError = 0;
 uint8_t  uvpCounter[126], uvpError = 0;
 uint8_t  otpCounter[126], otpError = 0;
 uint8_t  utpCounter[126], utpError = 0;
-uint8_t  spiErrorCounter[12], spiError = 0;
+uint8_t  spiTemperatureErrorCounter[24], spiVoltageErrorCounter[24], spiError = 0;
 
 uint8_t amsTxMessageCounter = 0;
 uint8_t cellOrTemp = 0;
@@ -144,7 +157,7 @@ uint8_t spiTxData[8], spiRxData[8], voltagesPerRegister;
 uint8_t nrOfCells[] = {10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11};
 uint8_t cellBaseNum[] = {0, 10, 21, 31, 42, 52, 63, 73, 84, 94, 105, 115};
 uint16_t command, pec, rawVoltage, rawTemp;
-uint32_t tick, lastTick = 0, deltaTick;
+uint32_t tick, lastTick = 0, deltaTick, isospiRxCount = 0, isospiRxErrorCount = 0;
 
 // FSM stuff
 State_t fsmState = STATE_IDLE;
@@ -911,12 +924,14 @@ static void voltageReadings(void)
       HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_RESET);
       HAL_SPI_TransmitReceive(&hspi1, spiTxData, spiRxData, 4+8, HAL_MAX_DELAY);
       HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_SET);
+      isospiRxCount++;
       // check PEC
       pec = (0xFF00 & (spiRxData[6] << 8)) | (0xFF & spiRxData[7]);
       if (pec != pec15_calc(6, spiRxData))
       {
-        spiErrorCounter[i]++;
-        if (spiErrorCounter[i] >= SPI_ERROR_COUNT_THRESHOLD)
+        spiVoltageErrorCounter[i]++;
+        isospiRxErrorCount++;
+        if (spiVoltageErrorCounter[i] >= SPI_ERROR_COUNT_THRESHOLD)
         {
           spiError = 1; // Set SPI error
         }
@@ -927,7 +942,7 @@ static void voltageReadings(void)
       }
       else
       {
-        spiErrorCounter[i] = 0; // Reset error counter
+        spiVoltageErrorCounter[i] = 0; // Reset error counter
 
         // check how many cells we should read from this register
         if (j == 4) // Last register
@@ -1006,12 +1021,15 @@ static void temperatureReadings(void)
       HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_RESET);
       HAL_SPI_TransmitReceive(&hspi1, spiTxData, spiRxData, 4+8, HAL_MAX_DELAY);
       HAL_GPIO_WritePin(SPI1_SSN_GPIO_Port, SPI1_SSN_Pin, GPIO_PIN_SET);
+      isospiRxCount++;
       // check PEC
       pec = (0xFF00 & (spiRxData[6] << 8)) | (0xFF & spiRxData[7]);
       if (pec != pec15_calc(6, spiRxData))
       {
-        spiErrorCounter[i]++;
-        if (spiErrorCounter[i] >= SPI_ERROR_COUNT_THRESHOLD)
+        spiTemperatureErrorCounter[i]++;
+        isospiRxErrorCount++;
+        // check if we have too many errors
+        if (spiTemperatureErrorCounter[i] >= SPI_ERROR_COUNT_THRESHOLD)
         {
           spiError = 1; // Set SPI error
         }
@@ -1021,9 +1039,9 @@ static void temperatureReadings(void)
         }
       } else
       {
-        spiErrorCounter[i] = 0; // Reset error counter
+        spiTemperatureErrorCounter[i] = 0; // Reset error counter
         // check how many temperatures we should read from this register
-        voltagesPerRegister = (j ==0) ? 3 : 2;
+        voltagesPerRegister = (j==0) ? 3 : 2;
         for (uint8_t k = 0; k < voltagesPerRegister; k++) // foreach temperature in register
         {
           rawTemp = (spiRxData[2 * k + 1] << 8) | spiRxData[2 * k];
@@ -1461,21 +1479,20 @@ static void temperatureSendCan(void)
   switch (amsTxMessageCounter % 12)
   {
   case 0:
-    can1_ams_cell_temperatures.temperature_multiplexor = 0;
-    can1_ams_cell_temperatures.t1s1 = can1_ams_cell_temperatures_t1s1_encode(
+    can1_ams_s01_temperatures.s01t01 = can1_ams_s01_temperatures_s01t01_encode(
         thermistor_adc_to_c_float(rawTemps[0]));
-    can1_ams_cell_temperatures.t2s1 = can1_ams_cell_temperatures_t1s2_encode(
+    can1_ams_s01_temperatures.s01t02 = can1_ams_s01_temperatures_s01t02_encode(
         thermistor_adc_to_c_float(rawTemps[1]));
-    can1_ams_cell_temperatures.t3s1 = can1_ams_cell_temperatures_t1s3_encode(
+    can1_ams_s01_temperatures.s01t03 = can1_ams_s01_temperatures_s01t03_encode(
         thermistor_adc_to_c_float(rawTemps[2]));
-    can1_ams_cell_temperatures.t4s1 = can1_ams_cell_temperatures_t1s4_encode(
+    can1_ams_s01_temperatures.s01t04 = can1_ams_s01_temperatures_s01t04_encode(
         thermistor_adc_to_c_float(rawTemps[3]));
-    can1_ams_cell_temperatures.t5s1 = can1_ams_cell_temperatures_t1s5_encode(
+    can1_ams_s01_temperatures.s01t05 = can1_ams_s01_temperatures_s01t05_encode(
         thermistor_adc_to_c_float(rawTemps[4]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s01_temperatures_pack(txData, &can1_ams_s01_temperatures, CAN1_AMS_S01_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S01_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S01_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1483,16 +1500,20 @@ static void temperatureSendCan(void)
     break;
 
   case 1:
-    can1_ams_cell_temperatures.temperature_multiplexor = 1;
-    can1_ams_cell_temperatures.t1s2 = can1_ams_cell_temperatures_t1s2_encode(thermistor_adc_to_c_float(rawTemps[5]));
-    can1_ams_cell_temperatures.t2s2 = can1_ams_cell_temperatures_t2s2_encode(thermistor_adc_to_c_float(rawTemps[6]));
-    can1_ams_cell_temperatures.t3s2 = can1_ams_cell_temperatures_t3s2_encode(thermistor_adc_to_c_float(rawTemps[7]));
-    can1_ams_cell_temperatures.t4s2 = can1_ams_cell_temperatures_t4s2_encode(thermistor_adc_to_c_float(rawTemps[8]));
-    can1_ams_cell_temperatures.t5s2 = can1_ams_cell_temperatures_t5s2_encode(thermistor_adc_to_c_float(rawTemps[9]));
+    can1_ams_s02_temperatures.s02t01 = can1_ams_s02_temperatures_s02t01_encode(
+        thermistor_adc_to_c_float(rawTemps[5]));
+    can1_ams_s02_temperatures.s02t02 = can1_ams_s02_temperatures_s02t02_encode(
+        thermistor_adc_to_c_float(rawTemps[6]));
+    can1_ams_s02_temperatures.s02t03 = can1_ams_s02_temperatures_s02t03_encode(
+        thermistor_adc_to_c_float(rawTemps[7]));
+    can1_ams_s02_temperatures.s02t04 = can1_ams_s02_temperatures_s02t04_encode(
+        thermistor_adc_to_c_float(rawTemps[8]));
+    can1_ams_s02_temperatures.s02t05 = can1_ams_s02_temperatures_s02t05_encode(
+        thermistor_adc_to_c_float(rawTemps[9]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s02_temperatures_pack(txData, &can1_ams_s02_temperatures, CAN1_AMS_S02_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S02_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S02_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1500,21 +1521,20 @@ static void temperatureSendCan(void)
     break;
 
   case 2:
-    can1_ams_cell_temperatures.temperature_multiplexor = 2;
-    can1_ams_cell_temperatures.t1s3 = can1_ams_cell_temperatures_t1s3_encode(
+    can1_ams_s03_temperatures.s03t01 = can1_ams_s03_temperatures_s03t01_encode(
         thermistor_adc_to_c_float(rawTemps[10]));
-    can1_ams_cell_temperatures.t2s3 = can1_ams_cell_temperatures_t2s3_encode(
+    can1_ams_s03_temperatures.s03t02 = can1_ams_s03_temperatures_s03t02_encode(
         thermistor_adc_to_c_float(rawTemps[11]));
-    can1_ams_cell_temperatures.t3s3 = can1_ams_cell_temperatures_t3s3_encode(
+    can1_ams_s03_temperatures.s03t03 = can1_ams_s03_temperatures_s03t03_encode(
         thermistor_adc_to_c_float(rawTemps[12]));
-    can1_ams_cell_temperatures.t4s3 = can1_ams_cell_temperatures_t4s3_encode(
+    can1_ams_s03_temperatures.s03t04 = can1_ams_s03_temperatures_s03t04_encode(
         thermistor_adc_to_c_float(rawTemps[13]));
-    can1_ams_cell_temperatures.t5s3 = can1_ams_cell_temperatures_t5s3_encode(
+    can1_ams_s03_temperatures.s03t05 = can1_ams_s03_temperatures_s03t05_encode(
         thermistor_adc_to_c_float(rawTemps[14]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s03_temperatures_pack(txData, &can1_ams_s03_temperatures, CAN1_AMS_S03_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S03_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S03_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1522,21 +1542,20 @@ static void temperatureSendCan(void)
     break;
 
   case 3:
-    can1_ams_cell_temperatures.temperature_multiplexor = 3;
-    can1_ams_cell_temperatures.t1s4 = can1_ams_cell_temperatures_t1s4_encode(
+    can1_ams_s04_temperatures.s04t01 = can1_ams_s04_temperatures_s04t01_encode(
         thermistor_adc_to_c_float(rawTemps[15]));
-    can1_ams_cell_temperatures.t2s4 = can1_ams_cell_temperatures_t2s4_encode(
+    can1_ams_s04_temperatures.s04t02 = can1_ams_s04_temperatures_s04t02_encode(
         thermistor_adc_to_c_float(rawTemps[16]));
-    can1_ams_cell_temperatures.t3s4 = can1_ams_cell_temperatures_t3s4_encode(
+    can1_ams_s04_temperatures.s04t03 = can1_ams_s04_temperatures_s04t03_encode(
         thermistor_adc_to_c_float(rawTemps[17]));
-    can1_ams_cell_temperatures.t4s4 = can1_ams_cell_temperatures_t4s4_encode(
+    can1_ams_s04_temperatures.s04t04 = can1_ams_s04_temperatures_s04t04_encode(
         thermistor_adc_to_c_float(rawTemps[18]));
-    can1_ams_cell_temperatures.t5s4 = can1_ams_cell_temperatures_t5s4_encode(
+    can1_ams_s04_temperatures.s04t05 = can1_ams_s04_temperatures_s04t05_encode(
         thermistor_adc_to_c_float(rawTemps[19]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s04_temperatures_pack(txData, &can1_ams_s04_temperatures, CAN1_AMS_S04_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S04_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S04_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1544,21 +1563,20 @@ static void temperatureSendCan(void)
     break;
 
   case 4:
-    can1_ams_cell_temperatures.temperature_multiplexor = 4;
-    can1_ams_cell_temperatures.t1s5 = can1_ams_cell_temperatures_t1s5_encode(
+    can1_ams_s05_temperatures.s05t01 = can1_ams_s05_temperatures_s05t01_encode(
         thermistor_adc_to_c_float(rawTemps[20]));
-    can1_ams_cell_temperatures.t2s5 = can1_ams_cell_temperatures_t2s5_encode(
+    can1_ams_s05_temperatures.s05t02 = can1_ams_s05_temperatures_s05t02_encode(
         thermistor_adc_to_c_float(rawTemps[21]));
-    can1_ams_cell_temperatures.t3s5 = can1_ams_cell_temperatures_t3s5_encode(
+    can1_ams_s05_temperatures.s05t03 = can1_ams_s05_temperatures_s05t03_encode(
         thermistor_adc_to_c_float(rawTemps[22]));
-    can1_ams_cell_temperatures.t4s5 = can1_ams_cell_temperatures_t4s5_encode(
+    can1_ams_s05_temperatures.s05t04 = can1_ams_s05_temperatures_s05t04_encode(
         thermistor_adc_to_c_float(rawTemps[23]));
-    can1_ams_cell_temperatures.t5s5 = can1_ams_cell_temperatures_t5s5_encode(
+    can1_ams_s05_temperatures.s05t05 = can1_ams_s05_temperatures_s05t05_encode(
         thermistor_adc_to_c_float(rawTemps[24]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s05_temperatures_pack(txData, &can1_ams_s05_temperatures, CAN1_AMS_S05_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S05_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S05_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1566,21 +1584,20 @@ static void temperatureSendCan(void)
     break;
 
   case 5:
-    can1_ams_cell_temperatures.temperature_multiplexor = 5;
-    can1_ams_cell_temperatures.t1s6 = can1_ams_cell_temperatures_t1s6_encode(
+    can1_ams_s06_temperatures.s06t01 = can1_ams_s06_temperatures_s06t01_encode(
         thermistor_adc_to_c_float(rawTemps[25]));
-    can1_ams_cell_temperatures.t2s6 = can1_ams_cell_temperatures_t2s6_encode(
+    can1_ams_s06_temperatures.s06t02 = can1_ams_s06_temperatures_s06t02_encode(
         thermistor_adc_to_c_float(rawTemps[26]));
-    can1_ams_cell_temperatures.t3s6 = can1_ams_cell_temperatures_t3s6_encode(
+    can1_ams_s06_temperatures.s06t03 = can1_ams_s06_temperatures_s06t03_encode(
         thermistor_adc_to_c_float(rawTemps[27]));
-    can1_ams_cell_temperatures.t4s6 = can1_ams_cell_temperatures_t4s6_encode(
+    can1_ams_s06_temperatures.s06t04 = can1_ams_s06_temperatures_s06t04_encode(
         thermistor_adc_to_c_float(rawTemps[28]));
-    can1_ams_cell_temperatures.t5s6 = can1_ams_cell_temperatures_t5s6_encode(
+    can1_ams_s06_temperatures.s06t05 = can1_ams_s06_temperatures_s06t05_encode(
         thermistor_adc_to_c_float(rawTemps[29]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s06_temperatures_pack(txData, &can1_ams_s06_temperatures, CAN1_AMS_S06_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S06_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S06_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1588,21 +1605,20 @@ static void temperatureSendCan(void)
     break;
 
   case 6:
-    can1_ams_cell_temperatures.temperature_multiplexor = 6;
-    can1_ams_cell_temperatures.t1s7 = can1_ams_cell_temperatures_t1s7_encode(
+    can1_ams_s07_temperatures.s07t01 = can1_ams_s07_temperatures_s07t01_encode(
         thermistor_adc_to_c_float(rawTemps[30]));
-    can1_ams_cell_temperatures.t2s7 = can1_ams_cell_temperatures_t2s7_encode(
+    can1_ams_s07_temperatures.s07t02 = can1_ams_s07_temperatures_s07t02_encode(
         thermistor_adc_to_c_float(rawTemps[31]));
-    can1_ams_cell_temperatures.t3s7 = can1_ams_cell_temperatures_t3s7_encode(
+    can1_ams_s07_temperatures.s07t03 = can1_ams_s07_temperatures_s07t03_encode(
         thermistor_adc_to_c_float(rawTemps[32]));
-    can1_ams_cell_temperatures.t4s7 = can1_ams_cell_temperatures_t4s7_encode(
+    can1_ams_s07_temperatures.s07t04 = can1_ams_s07_temperatures_s07t04_encode(
         thermistor_adc_to_c_float(rawTemps[33]));
-    can1_ams_cell_temperatures.t5s7 = can1_ams_cell_temperatures_t5s7_encode(
+    can1_ams_s07_temperatures.s07t05 = can1_ams_s07_temperatures_s07t05_encode(
         thermistor_adc_to_c_float(rawTemps[34]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s07_temperatures_pack(txData, &can1_ams_s07_temperatures, CAN1_AMS_S07_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S07_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S07_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1610,21 +1626,20 @@ static void temperatureSendCan(void)
     break;
 
   case 7:
-    can1_ams_cell_temperatures.temperature_multiplexor = 7;
-    can1_ams_cell_temperatures.t1s8 = can1_ams_cell_temperatures_t1s8_encode(
+    can1_ams_s08_temperatures.s08t01 = can1_ams_s08_temperatures_s08t01_encode(
         thermistor_adc_to_c_float(rawTemps[35]));
-    can1_ams_cell_temperatures.t2s8 = can1_ams_cell_temperatures_t2s8_encode(
+    can1_ams_s08_temperatures.s08t02 = can1_ams_s08_temperatures_s08t02_encode(
         thermistor_adc_to_c_float(rawTemps[36]));
-    can1_ams_cell_temperatures.t3s8 = can1_ams_cell_temperatures_t3s8_encode(
+    can1_ams_s08_temperatures.s08t03 = can1_ams_s08_temperatures_s08t03_encode(
         thermistor_adc_to_c_float(rawTemps[37]));
-    can1_ams_cell_temperatures.t4s8 = can1_ams_cell_temperatures_t4s8_encode(
+    can1_ams_s08_temperatures.s08t04 = can1_ams_s08_temperatures_s08t04_encode(
         thermistor_adc_to_c_float(rawTemps[38]));
-    can1_ams_cell_temperatures.t5s8 = can1_ams_cell_temperatures_t5s8_encode(
+    can1_ams_s08_temperatures.s08t05 = can1_ams_s08_temperatures_s08t05_encode(
         thermistor_adc_to_c_float(rawTemps[39]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s08_temperatures_pack(txData, &can1_ams_s08_temperatures, CAN1_AMS_S08_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S08_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S08_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1632,21 +1647,20 @@ static void temperatureSendCan(void)
     break;
 
   case 8:
-    can1_ams_cell_temperatures.temperature_multiplexor = 8;
-    can1_ams_cell_temperatures.t1s9 = can1_ams_cell_temperatures_t1s9_encode(
+    can1_ams_s09_temperatures.s09t01 = can1_ams_s09_temperatures_s09t01_encode(
         thermistor_adc_to_c_float(rawTemps[40]));
-    can1_ams_cell_temperatures.t2s9 = can1_ams_cell_temperatures_t2s9_encode(
+    can1_ams_s09_temperatures.s09t02 = can1_ams_s09_temperatures_s09t02_encode(
         thermistor_adc_to_c_float(rawTemps[41]));
-    can1_ams_cell_temperatures.t3s9 = can1_ams_cell_temperatures_t3s9_encode(
+    can1_ams_s09_temperatures.s09t03 = can1_ams_s09_temperatures_s09t03_encode(
         thermistor_adc_to_c_float(rawTemps[42]));
-    can1_ams_cell_temperatures.t4s9 = can1_ams_cell_temperatures_t4s9_encode(
+    can1_ams_s09_temperatures.s09t04 = can1_ams_s09_temperatures_s09t04_encode(
         thermistor_adc_to_c_float(rawTemps[43]));
-    can1_ams_cell_temperatures.t5s9 = can1_ams_cell_temperatures_t5s9_encode(
+    can1_ams_s09_temperatures.s09t05 = can1_ams_s09_temperatures_s09t05_encode(
         thermistor_adc_to_c_float(rawTemps[44]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s09_temperatures_pack(txData, &can1_ams_s09_temperatures, CAN1_AMS_S09_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S09_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S09_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1654,21 +1668,20 @@ static void temperatureSendCan(void)
     break;
 
   case 9:
-    can1_ams_cell_temperatures.temperature_multiplexor = 9;
-    can1_ams_cell_temperatures.t1s10 = can1_ams_cell_temperatures_t1s10_encode(
+    can1_ams_s10_temperatures.s10t01 = can1_ams_s10_temperatures_s10t01_encode(
         thermistor_adc_to_c_float(rawTemps[45]));
-    can1_ams_cell_temperatures.t2s10 = can1_ams_cell_temperatures_t2s10_encode(
+    can1_ams_s10_temperatures.s10t02 = can1_ams_s10_temperatures_s10t02_encode(
         thermistor_adc_to_c_float(rawTemps[46]));
-    can1_ams_cell_temperatures.t3s10 = can1_ams_cell_temperatures_t3s10_encode(
+    can1_ams_s10_temperatures.s10t03 = can1_ams_s10_temperatures_s10t03_encode(
         thermistor_adc_to_c_float(rawTemps[47]));
-    can1_ams_cell_temperatures.t4s10 = can1_ams_cell_temperatures_t4s10_encode(
+    can1_ams_s10_temperatures.s10t04 = can1_ams_s10_temperatures_s10t04_encode(
         thermistor_adc_to_c_float(rawTemps[48]));
-    can1_ams_cell_temperatures.t5s10 = can1_ams_cell_temperatures_t5s10_encode(
+    can1_ams_s10_temperatures.s10t05 = can1_ams_s10_temperatures_s10t05_encode(
         thermistor_adc_to_c_float(rawTemps[49]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s10_temperatures_pack(txData, &can1_ams_s10_temperatures, CAN1_AMS_S10_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S10_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S10_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1676,21 +1689,20 @@ static void temperatureSendCan(void)
     break;
 
   case 10:
-    can1_ams_cell_temperatures.temperature_multiplexor = 10;
-    can1_ams_cell_temperatures.t1s11 = can1_ams_cell_temperatures_t1s11_encode(
+    can1_ams_s11_temperatures.s11t01 = can1_ams_s11_temperatures_s11t01_encode(
         thermistor_adc_to_c_float(rawTemps[50]));
-    can1_ams_cell_temperatures.t2s11 = can1_ams_cell_temperatures_t2s11_encode(
+    can1_ams_s11_temperatures.s11t02 = can1_ams_s11_temperatures_s11t02_encode(
         thermistor_adc_to_c_float(rawTemps[51]));
-    can1_ams_cell_temperatures.t3s11 = can1_ams_cell_temperatures_t3s11_encode(
+    can1_ams_s11_temperatures.s11t03 = can1_ams_s11_temperatures_s11t03_encode(
         thermistor_adc_to_c_float(rawTemps[52]));
-    can1_ams_cell_temperatures.t4s11 = can1_ams_cell_temperatures_t4s11_encode(
+    can1_ams_s11_temperatures.s11t04 = can1_ams_s11_temperatures_s11t04_encode(
         thermistor_adc_to_c_float(rawTemps[53]));
-    can1_ams_cell_temperatures.t5s11 = can1_ams_cell_temperatures_t5s11_encode(
+    can1_ams_s11_temperatures.s11t05 = can1_ams_s11_temperatures_s11t05_encode(
         thermistor_adc_to_c_float(rawTemps[54]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s11_temperatures_pack(txData, &can1_ams_s11_temperatures, CAN1_AMS_S11_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S11_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S11_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1698,21 +1710,20 @@ static void temperatureSendCan(void)
     break;
 
   case 11:
-    can1_ams_cell_temperatures.temperature_multiplexor = 11;
-    can1_ams_cell_temperatures.t1s12 = can1_ams_cell_temperatures_t1s12_encode(
+    can1_ams_s12_temperatures.s12t01 = can1_ams_s12_temperatures_s12t01_encode(
         thermistor_adc_to_c_float(rawTemps[55]));
-    can1_ams_cell_temperatures.t2s12 = can1_ams_cell_temperatures_t2s12_encode(
+    can1_ams_s12_temperatures.s12t02 = can1_ams_s12_temperatures_s12t02_encode(
         thermistor_adc_to_c_float(rawTemps[56]));
-    can1_ams_cell_temperatures.t3s12 = can1_ams_cell_temperatures_t3s12_encode(
+    can1_ams_s12_temperatures.s12t03 = can1_ams_s12_temperatures_s12t03_encode(
         thermistor_adc_to_c_float(rawTemps[57]));
-    can1_ams_cell_temperatures.t4s12 = can1_ams_cell_temperatures_t4s12_encode(
+    can1_ams_s12_temperatures.s12t04 = can1_ams_s12_temperatures_s12t04_encode(
         thermistor_adc_to_c_float(rawTemps[58]));
-    can1_ams_cell_temperatures.t5s12 = can1_ams_cell_temperatures_t5s12_encode(
+    can1_ams_s12_temperatures.s12t05 = can1_ams_s12_temperatures_s12t05_encode(
         thermistor_adc_to_c_float(rawTemps[59]));
 
-    can1_ams_cell_temperatures_pack(txData, &can1_ams_cell_temperatures, CAN1_AMS_CELL_TEMPERATURES_LENGTH);
-    txHeader.StdId = CAN1_AMS_CELL_TEMPERATURES_FRAME_ID;
-    txHeader.DLC = CAN1_AMS_CELL_TEMPERATURES_LENGTH;
+    can1_ams_s12_temperatures_pack(txData, &can1_ams_s12_temperatures, CAN1_AMS_S12_TEMPERATURES_LENGTH);
+    txHeader.StdId = CAN1_AMS_S12_TEMPERATURES_FRAME_ID;
+    txHeader.DLC = CAN1_AMS_S12_TEMPERATURES_LENGTH;
     txHeader.IDE = CAN_ID_STD;
     txHeader.RTR = CAN_RTR_DATA;
     if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
@@ -1796,12 +1807,35 @@ static void sendStatus(void)
   uint16_t minVoltage = 0xFFFF;
   uint16_t maxTemperature = 0;
   uint16_t minTemperature = 0xFFFF;
+  uint8_t maxOvp = 0;
+  uint8_t maxUvp = 0;
+  uint8_t maxOtp = 0;
+  uint8_t maxUtp = 0;
+  uint8_t maxIsospiErrorCounter = 0;
   for (int i = 0; i < 126; i++)
   {
     if (rawVoltages[i] > maxVoltage)
       maxVoltage = rawVoltages[i];
     if (rawVoltages[i] < minVoltage)
       minVoltage = rawVoltages[i];
+    if (ovpCounter[i] > maxOvp)
+      maxOvp = ovpCounter[i];
+    if (uvpCounter[i] > maxUvp)
+      maxUvp = uvpCounter[i];
+    if (otpCounter[i] > maxOtp)
+      maxOtp = otpCounter[i];
+    if (utpCounter[i] > maxUtp)
+      maxUtp = utpCounter[i];
+  }
+  for (int i = 0; i < 24; i++)
+  {
+    if (spiVoltageErrorCounter[i] > maxIsospiErrorCounter)
+      maxIsospiErrorCounter = spiVoltageErrorCounter[i];
+  }
+  for (int i = 0; i < 12; i++)
+  {
+    if (spiTemperatureErrorCounter[i] > maxIsospiErrorCounter)
+      maxIsospiErrorCounter = spiTemperatureErrorCounter[i];
   }
   for (int i = 0; i < 12; i++)
   {
@@ -1810,6 +1844,7 @@ static void sendStatus(void)
     if (rawTemps[i] < minTemperature)
       minTemperature = rawTemps[i];
   }
+
   can1_ams_status_1.max_cell_voltage = can1_ams_status_1_max_cell_voltage_encode((float) maxVoltage / 10000.0);
   can1_ams_status_1.min_cell_voltage = can1_ams_status_1_min_cell_voltage_encode((float) minVoltage / 10000.0);
   can1_ams_status_1.max_cell_temperature = can1_ams_status_1_max_cell_temperature_encode(
@@ -1821,6 +1856,22 @@ static void sendStatus(void)
   can1_ams_status_1_pack(txData, &can1_ams_status_1, CAN1_AMS_STATUS_1_LENGTH);
   txHeader.StdId = CAN1_AMS_STATUS_1_FRAME_ID;
   txHeader.DLC = CAN1_AMS_STATUS_1_LENGTH;
+  txHeader.IDE = CAN_ID_STD;
+  txHeader.RTR = CAN_RTR_DATA;
+  if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
+    Error_Handler();
+
+  can1_ams_status_2.isospi_rx_error_rate = can1_ams_status_2_isospi_rx_error_rate_encode(
+      (float) isospiRxErrorCount / (float) isospiRxCount);
+  can1_ams_status_2.isospi_tx_error_rate = 0xFF; // not implemented yet
+  can1_ams_status_2.max_otp_counter = can1_ams_status_2_max_otp_counter_encode(maxOtp);
+  can1_ams_status_2.max_uvp_counter = can1_ams_status_2_max_uvp_counter_encode(maxUvp);
+  can1_ams_status_2.max_ovp_counter = can1_ams_status_2_max_ovp_counter_encode(maxOvp);
+  can1_ams_status_2.max_utp_counter = can1_ams_status_2_max_utp_counter_encode(maxUtp);
+  can1_ams_status_2.max_isospi_error_counter = can1_ams_status_2_max_isospi_error_counter_encode(maxIsospiErrorCounter);
+  can1_ams_status_2_pack(txData, &can1_ams_status_2, CAN1_AMS_STATUS_2_LENGTH);
+  txHeader.StdId = CAN1_AMS_STATUS_2_FRAME_ID;
+  txHeader.DLC = CAN1_AMS_STATUS_2_LENGTH;
   txHeader.IDE = CAN_ID_STD;
   txHeader.RTR = CAN_RTR_DATA;
   if (HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, NULL) != HAL_OK)
